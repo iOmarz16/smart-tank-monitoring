@@ -227,5 +227,90 @@ r.hold(10.0 * MV_PER_MBAR, 2)
 check("TEST trip does not auto-clear (pump never restarts by itself)", r.s.state == "TRIPPED"
       and not r.s.pump_on)
 
+# 13. A34: the team leak model is LOG AND DISPLAY ONLY. P_comp (and P_corr, leak_rate)
+#     must never feed a trip, the warning, the PI or the plausibility checks.
+import inspect  # noqa: E402
+import re  # noqa: E402
+
+FW = fr.ROOT / "firmware"
+LEAK_TOKENS = re.compile(r"leak|p_comp|p_corr|PUMP_ON_OFFSET|K_LEAK|P_COMP_RESET", re.IGNORECASE)
+
+
+def code_only(src: str) -> str:
+    """C++ source without // and /* */ comments (string literals are not an issue here)."""
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", src, flags=re.DOTALL)
+
+
+# 13a. Static, firmware: the supervisor (every trip, warning, PI and plausibility decision)
+#      has no reference to the leak model at all, not even in comments.
+for name in ("supervisor.cpp", "supervisor.h"):
+    hits = sorted({m.group(0) for m in LEAK_TOKENS.finditer((FW / "src" / name).read_text(encoding="utf-8"))})
+    check(f"A34 {name} never references the leak model", not hits, ", ".join(hits))
+includers = sorted(p.name for p in (FW / "src").glob("*.*") if re.search(
+    r'#\s*include\s*"leak_model\.h"', p.read_text(encoding="utf-8")))
+check("A34 leak_model.h included by control_task.cpp only", includers == ["control_task.cpp"], str(includers))
+ct = code_only((FW / "src" / "control_task.cpp").read_text(encoding="utf-8"))
+i_step, i_leak = ct.find("sup.step("), ct.find("leak_model.update(")
+check("A34 leak model computed after sup.step() in the control task", 0 <= i_step < i_leak,
+      f"step@{i_step} leak@{i_leak}")
+bad = [ln.strip() for ln in ct.splitlines() if "sup." in ln and re.search(r"\blr\b|leak|p_comp|p_corr", ln)]
+check("A34 no leak model value is passed to the supervisor", not bad, "; ".join(bad))
+uses = [ln.strip() for ln in ct.splitlines() if re.search(r"\blr\.", ln)]
+ok_use = re.compile(r"s\.(p_corr|p_comp_assumed|leak_rate) = lr\.(p_corr|p_comp|leak_rate);")
+check("A34 leak results only go into the logged Sample", len(uses) == 3 and all(ok_use.fullmatch(u) for u in uses),
+      "; ".join(uses))
+
+# 13b. Static, Python port: the simulated Supervisor never sees the leak model either.
+hits = sorted({m.group(0) for m in LEAK_TOKENS.finditer(inspect.getsource(fr.Supervisor))})
+check("A34 fake_rig Supervisor never references the leak model", not hits, ", ".join(hits))
+
+# 13c. Model arithmetic (Python port of leak_model.h) at Ts = 0.1 s.
+check("A34 per-step constants scaled to TS_S = 0.1 s", C["TS_S"] == 0.1 and C["CONTROL_PERIOD_MS"] == 100)
+m = fr.LeakModel()
+pc, pcomp, lr = m.update(4.0, True, 100.0)
+exp_lr = C["K_LEAK_PUMP_ON"] * (4.0 + C["PUMP_ON_OFFSET"]) ** 0.5
+check("A34 P_corr = P_f + 0.19 while the pump ran", abs(pc - 4.19) < 1e-9, f"{pc}")
+check("A34 leak_rate = k_on * sqrt(P_corr)", abs(lr - exp_lr) < 1e-12, f"{lr}")
+check("A34 one fully closed step adds leak_rate * 0.1 s (not 0.2 s)", abs(pcomp - (pc + exp_lr * 0.1)) < 1e-12,
+      f"{pcomp - pc:.6f} mbar")
+m = fr.LeakModel()
+_, half, _ = m.update(4.0, True, 50.0)
+check("A34 a 50 % closed step adds half (duty weighting)", abs(half - (4.19 + exp_lr * 0.05)) < 1e-12)
+m = fr.LeakModel()
+_, op, _ = m.update(4.0, False, 0.0)
+check("A34 open valve adds nothing", op == 4.0)
+m = fr.LeakModel()
+m.update(4.0, True, 100.0)
+m.update(4.0, True, 100.0)
+_, kept, _ = m.update(0.04, True, 0.0)
+check("A34 no reset while the pump is ON", kept > 0.04 + C["PUMP_ON_OFFSET"])
+_, reset, _ = m.update(0.04, False, 0.0)
+check("A34 reset when pump OFF and P_corr < 0.05", reset == 0.04 and m.lost == 0.0)
+pc, pcomp, lr = fr.LeakModel().update(fr.NAN, False, 100.0)
+check("A34 no P_f yet -> all NaN", all(x != x for x in (pc, pcomp, lr)))
+
+# 13d. Closed loop: RUN at a measured 5 mbar(g), pump ON, vent closed by the PI for 5 min.
+#      P_comp climbs past the 14 / 20 / 29 mbar(g) levels; nothing may react to it.
+r = Run(zero_ok=True)
+r.run_at(5.0)
+m, mp, md = fr.LeakModel(), False, 0.0
+max_comp, events = 0.0, set()
+for _ in range(3000):
+    r.step(5.0 * MV_PER_MBAR)
+    _, pcomp, _ = m.update(r.s.p_f, mp, md)
+    mp, md = r.s.pump_on, r.s.valve_duty
+    max_comp = max(max_comp, pcomp)
+    events |= {x for x, on in (("trip", r.s.state != "RUN"), ("warning", r.s.warning)) if on}
+check("A34 P_comp rose past the hard limit in the scenario", max_comp > C["P_HARD_LIMIT"], f"{max_comp:.1f}")
+check("A34 P_comp above 29 causes no trip and no warning (measured 5 mbar(g))", not events,
+      f"{events} state={r.s.state}/{r.s.reason}")
+
+# 13e. Dashboard: P_comp_assumed is only drawn (chart) and printed (its own readout);
+#      the status colour, warning and trip display never read it.
+js = (fr.ROOT / "dashboard" / "static" / "app.js").read_text(encoding="utf-8")
+uses = [ln.strip() for ln in js.splitlines() if "P_comp" in ln and not ln.strip().startswith("//")]
+check("A34 dashboard status/warning/trip never read P_comp_assumed",
+      len(uses) == 1 and uses[0].startswith('$("pcomp").textContent'), "; ".join(uses))
+
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

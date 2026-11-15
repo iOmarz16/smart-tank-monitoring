@@ -47,6 +47,12 @@ struct Sample {
   bool trip_latched;       // tripped and only RESET can clear it (A30); false while a SOFT_LIMIT trip may auto-clear
   uint8_t auto_clears;     // SOFT_LIMIT auto-clears within the last SOFT_AUTOCLEAR_WINDOW_S
   bool auto_clear_event;   // internal (not in the JSON): a SOFT_LIMIT trip auto-cleared in this step
+  // Team leak model (A34), LOG AND DISPLAY ONLY. Filled by the control task after the
+  // supervisor step (src/leak_model.h); the supervisor never reads them.
+  float p_corr;            // mbar(g), P_f + PUMP_ON_OFFSET while the pump ran during the read
+  float p_comp_assumed;    // mbar(g), ASSUMED no-leak estimate; NOT the vessel pressure
+  float leak_rate;         // mbar/s, k * sqrt(P_corr)
+  bool leak_pump_on;       // internal (not in the JSON): pump state the model used (last loop's command)
 };
 
 // Commands from the serial task to the control task. Only the control task

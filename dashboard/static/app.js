@@ -82,6 +82,9 @@ function render() {
     $("pf").textContent = fmt(s.P_f);
     $("praw").textContent = fmt(s.P_raw);
     $("slope").textContent = fmt(s.slope, 3);
+    // A34: display only. The status block above, the warning and the trip display are
+    // decided from the measured fields alone; P_comp_assumed never enters them.
+    $("pcomp").textContent = fmt(s.P_comp_assumed);
     $("uopen").textContent = fmt(s.u_open, 1);
     $("uopen-bar").style.width = `${Math.max(0, Math.min(100, s.u_open || 0))}%`;
     $("pump").textContent = s.pump_on ? "ON" : "OFF";

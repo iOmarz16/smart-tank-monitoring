@@ -387,6 +387,31 @@ class Supervisor:
 
 
 # ---------------------------------------------------------------------------
+# Team leak model: line-by-line port of firmware/src/leak_model.h (A34).
+# LOG AND DISPLAY ONLY. P_comp is an ASSUMPTION, not the vessel pressure. The
+# Supervisor above never sees it (tools/check_rules.py checks this).
+# ---------------------------------------------------------------------------
+class LeakModel:
+    def __init__(self) -> None:
+        self.lost = 0.0  # mbar added so far
+
+    def update(self, p_f: float, pump_on: bool, closed_duty: float) -> tuple[float, float, float]:
+        """p_f of this sample; pump_on / closed_duty = outputs written in the PREVIOUS loop.
+        Returns (p_corr, p_comp, leak_rate)."""
+        if math.isnan(p_f):
+            return NAN, NAN, NAN
+        p_corr = p_f + (C["PUMP_ON_OFFSET"] if pump_on else 0.0)
+        k = C["K_LEAK_PUMP_ON"] if pump_on else C["K_LEAK_PUMP_OFF"]
+        leak_rate = k * math.sqrt(p_corr) if p_corr > 0.0 else 0.0
+        if not pump_on and p_corr < C["P_COMP_RESET_P"]:
+            self.lost = 0.0  # vessel empty -> reset
+        frac = closed_duty / 100.0
+        frac = 0.0 if not frac > 0.0 else min(frac, 1.0)
+        self.lost += leak_rate * C["TS_S"] * frac
+        return p_corr, p_corr + self.lost, leak_rate
+
+
+# ---------------------------------------------------------------------------
 # Plant: 5.0 L headspace, C = 5.20 std cm3/mbar (Section 5.2.1),
 # open vent passes 250 std cm3/min at 10 mbar(g) (HYSYS calibration).
 # ---------------------------------------------------------------------------
@@ -438,6 +463,10 @@ class Rig:
         self.led_mode = "VENT"   # LED_MODE_DEFAULT
         self.led_on = False
         self.t3: tuple[int, str] = (0, "NONE")
+        # Leak model (A34), display/log only; inputs are the previous loop's outputs.
+        self.leak = LeakModel()
+        self.model_pump_on = False
+        self.model_closed_duty = 0.0
         self.clients: set[ServerConnection] = set()
         self.new_sample = asyncio.Event()
 
@@ -523,6 +552,11 @@ class Rig:
             if reply:
                 print(f"[fake_rig] {cmd or 'LED MODE'} -> {reply}", flush=True)
             s = self.sup
+            # Leak model (A34) AFTER the supervisor step, like control_task.cpp.
+            p_corr, p_comp, leak_rate = self.leak.update(
+                s.p_f if s.pf_init else NAN, self.model_pump_on, self.model_closed_duty)
+            self.model_pump_on, self.model_closed_duty = s.pump_on, s.valve_duty
+            r4 = lambda x, n: None if math.isnan(x) else round(x, n)  # noqa: E731
             sample = {
                 "type": "sample", "seq": self.seq, "t_esp_ms": now_us // 1000,
                 "P_raw": None if math.isnan(s.p_raw) else round(s.p_raw, 4),
@@ -542,6 +576,8 @@ class Rig:
                 "reset_reason": "POWERON",
                 "trip_latched": s.state == "TRIPPED" and s.trip_latched,
                 "auto_clears": s.auto_clears_in_window(now_us),
+                "P_corr": r4(p_corr, 4), "P_comp_assumed": r4(p_comp, 2),
+                "leak_rate": r4(leak_rate, 4),
             }
             if s.auto_clear_new:
                 print(f"[fake_rig] EVENT AUTO-CLEAR SOFT_LIMIT -> RUN P_raw={s.p_raw:.3f} "
@@ -555,7 +591,8 @@ class Rig:
             self.seq += 1
             if self.seq % 50 == 0 or self.sup.trip_new:
                 print(f"[fake_rig] t={t:6.1f}s seq={self.seq} state={s.state} P={s.p_raw:6.2f} "
-                      f"P_true={self.plant.p:6.2f} u_open={s.u_open:5.1f} warn={s.warning} "
+                      f"P_true={self.plant.p:6.2f} P_comp_assumed={p_comp:6.2f} "
+                      f"u_open={s.u_open:5.1f} warn={s.warning} "
                       f"trip={s.reason} clients={len(self.clients)}", flush=True)
             self.new_sample.set()
 

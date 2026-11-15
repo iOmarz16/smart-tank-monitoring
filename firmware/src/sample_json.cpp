@@ -12,7 +12,7 @@ static const char *f(char *b, size_t n, float x, int prec) {
 static const char *tf(bool b) { return b ? "true" : "false"; }
 
 size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n) {
-  char a[16], b[16], c[16], d[16], e[16], g[16], h[16], i[16], j[16];
+  char a[16], b[16], c[16], d[16], e[16], g[16], h[16], i[16], j[16], k[16], l[16], m[16];
   int len = snprintf(
       buf, n,
       "{\"type\":\"sample\",\"seq\":%lu,\"t_esp_ms\":%lu,\"P_raw\":%s,\"P_f\":%s,\"valid\":%s,"
@@ -22,7 +22,7 @@ size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n) {
       "\"sensor_fault\":%s,\"zero_offset\":%s,\"zero_forced\":%s,\"trip_decision_us\":%llu,"
       "\"trip_output_us\":%llu,\"t3_us\":%llu,\"t3_source\":\"%s\",\"led_on\":%s,"
       "\"rb_valve_off\":%s,\"rb_pump_off\":%s,\"reset_reason\":\"%s\",\"trip_latched\":%s,"
-      "\"auto_clears\":%u}",
+      "\"auto_clears\":%u,\"P_corr\":%s,\"P_comp_assumed\":%s,\"leak_rate\":%s}",
       (unsigned long)s.seq, (unsigned long)s.t_esp_ms, f(a, 16, s.p_raw, 4), f(b, 16, s.p_f, 4),
       tf(s.valid), f(c, 16, s.u_open, 4), f(d, 16, s.integ, 5), f(e, 16, s.valve_duty, 4),
       tf(s.pump_on), tf(s.warning), f(g, 16, s.t_to_limit, 2), stateName(s.state), tf(s.trip),
@@ -31,7 +31,8 @@ size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n) {
       tf(s.zero_forced), (unsigned long long)s.trip_decision_us,
       (unsigned long long)s.trip_output_us, (unsigned long long)s.t3_us, t3SourceName(s.t3_source),
       tf(s.led_on), tf(s.rb_valve_off), tf(s.rb_pump_off), resetReasonName(s.reset_reason),
-      tf(s.trip_latched), (unsigned)s.auto_clears);
+      tf(s.trip_latched), (unsigned)s.auto_clears, f(k, 16, s.p_corr, 4),
+      f(l, 16, s.p_comp_assumed, 2), f(m, 16, s.leak_rate, 4));
   if (len < 0 || (size_t)len >= n) return 0;
   return (size_t)len;
 }

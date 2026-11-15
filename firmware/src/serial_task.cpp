@@ -378,9 +378,12 @@ void serialTask(void *) {
         const char *valve = s.valve_duty <= 0.0f    ? "RELEASED(open)"
                             : s.valve_duty >= 100.0f ? "ENERGIZED(closed)"
                                                      : "PWM";
-        Serial.printf("TEST P_raw=%.3f P_f=%.3f V_gpio=%.1fmV valid=%d pump=%s valve=%s duty=%.0f%%\n",
+        // Original columns first; the leak model columns (A34, ASSUMED, display only) last.
+        Serial.printf("TEST P_raw=%.3f P_f=%.3f V_gpio=%.1fmV valid=%d pump=%s valve=%s duty=%.0f%% "
+                      "P_corr=%.3f P_comp_assumed=%.3f leak=%.4f\n",
                       (double)s.p_raw, (double)s.p_f, (double)s.v_gpio_mv, s.valid ? 1 : 0,
-                      s.pump_on ? "ON" : "OFF", valve, (double)s.valve_duty);
+                      s.pump_on ? "ON" : "OFF", valve, (double)s.valve_duty, (double)s.p_corr,
+                      (double)s.p_comp_assumed, (double)s.leak_rate);
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));

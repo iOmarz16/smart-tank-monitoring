@@ -11,9 +11,10 @@
 // Memory fix (A33). The first version held 1500 full Sample structs (96 B) in ONE
 // calloc of 144 KB, larger than the largest free block of the ESP32 heap (~110 KB), so
 // it failed on the real board. Now:
-//   - each sample is stored packed in 44 B (scaled integers, bitfields; seq is implicit)
+//   - each sample is stored packed in 48 B (scaled integers, bitfields; seq is implicit;
+//     44 B before the leak model fields, A34)
 //   - the buffer is RING_SAMPLES / RING_CHUNK_SAMPLES separate allocations
-// 1500 x 44 B = 66 KB in 10 blocks of 6.6 KB. The control logic never reads the ring:
+// 1500 x 48 B = 72 KB in 10 blocks of 7.2 KB. The control logic never reads the ring:
 // packing only quantizes the LOGGED values (see the scales below and docs/protocol.md).
 
 namespace ring {
@@ -27,6 +28,10 @@ constexpr float SC_SLOPE = 1000.0f; // slope: 0.001 mbar/s, +/-32.7
 constexpr float SC_TTL = 50.0f;     // t_to_limit: 0.02 s, +/-655 s
 constexpr float SC_PCT = 100.0f;    // u_open, valve_duty: 0.01 %, 0..655 %
 constexpr float SC_ZERO = 5000.0f;  // zero_offset: 0.0002 mbar, +/-6.55 (cap is 5)
+// Leak model (A34), log only. P_comp grows without bound while the pump runs with the
+// vent closed, so it gets a wide range: 0.02 mbar, +/-655 mbar (saturates beyond).
+constexpr float SC_PCOMP = 50.0f;
+constexpr float SC_LEAK = 10000.0f; // leak_rate: 0.0001 mbar/s, +/-3.27 (max ~2 at 46 mbar)
 constexpr int16_t S16_NAN = INT16_MIN;
 
 struct Packed {
@@ -50,6 +55,7 @@ struct Packed {
   uint32_t test_pump_timeout : 1;
   uint32_t trip_latched : 1;
   uint32_t auto_clear_event : 1;
+  uint32_t leak_pump_on : 1;  // leak model pump state; P_corr = P_f + PUMP_ON_OFFSET if set
   uint32_t auto_clears : 4;
   uint32_t reset_reason : 5;
   uint16_t v_gpio;
@@ -62,8 +68,12 @@ struct Packed {
   int16_t zero_offset;
   uint16_t trip_dec_hi;       // trip_decision_us, bits 32..47 (8.9 years of uptime)
   uint16_t out_delta1;        // trip_output_us - trip_decision_us + 1 (saturates); 0 = none
+  // Leak model (A34). P_corr is not stored: it is exactly P_f + PUMP_ON_OFFSET when
+  // leak_pump_on is set, else P_f (NaN with P_f), so it costs one bit instead of 16.
+  int16_t p_comp;
+  int16_t leak_rate;
 };
-static_assert(sizeof(Packed) == 44, "packed sample layout changed");
+static_assert(sizeof(Packed) == 48, "packed sample layout changed");
 static_assert(RING_SAMPLES % RING_CHUNK_SAMPLES == 0, "RING_SAMPLES must be a multiple of the chunk");
 static_assert(RING_SAMPLES >= 900, "ring must hold >= 900 samples (60 s outage + margin): ask first");
 static_assert((int)State::TRIPPED < 8 && (int)TripReason::HARD_LIMIT < 4 &&
@@ -138,6 +148,9 @@ void pack(const Sample &s, Packed *p) {
   p->u_open = encU16(s.u_open, SC_PCT);
   p->valve_duty = encU16(s.valve_duty, SC_PCT);
   p->zero_offset = encS16(s.zero_offset, SC_ZERO);
+  p->leak_pump_on = s.leak_pump_on;
+  p->p_comp = encS16(s.p_comp_assumed, SC_PCOMP);
+  p->leak_rate = encS16(s.leak_rate, SC_LEAK);
 }
 
 void unpack(const Packed &p, uint32_t seq, Sample *s) {
@@ -174,6 +187,10 @@ void unpack(const Packed &p, uint32_t seq, Sample *s) {
   s->u_open = decU16(p.u_open, SC_PCT);
   s->valve_duty = decU16(p.valve_duty, SC_PCT);
   s->zero_offset = decS16(p.zero_offset, SC_ZERO);
+  s->leak_pump_on = p.leak_pump_on;
+  s->p_corr = s->p_f + (p.leak_pump_on ? PUMP_ON_OFFSET : 0.0f);  // NaN stays NaN
+  s->p_comp_assumed = decS16(p.p_comp, SC_PCOMP);
+  s->leak_rate = decS16(p.leak_rate, SC_LEAK);
 }
 
 Packed *slot(uint32_t seq) {
@@ -230,6 +247,10 @@ bool selfTest() {
   a.valid = a.pump_on = a.trip = a.zero_forced = a.rb_pump_off = a.trip_latched = true;
   a.auto_clears = 3;
   a.reset_reason = 10;
+  a.leak_pump_on = true;
+  a.p_corr = NAN;  // P_f is NaN here
+  a.p_comp_assumed = 123.456f;
+  a.leak_rate = 0.0876f;
   Packed p{};
   pack(a, &p);
   Sample b;
@@ -244,7 +265,27 @@ bool selfTest() {
             near(b.v_gpio_mv, a.v_gpio_mv, 0.05f) && near(b.p_raw, a.p_raw, 0.001f) &&
             near(b.p_f, a.p_f, 0.0f) && near(b.slope, a.slope, 0.0005f) &&
             near(b.t_to_limit, a.t_to_limit, 0.01f) && near(b.u_open, a.u_open, 0.005f) &&
-            near(b.valve_duty, a.valve_duty, 0.005f) && near(b.zero_offset, a.zero_offset, 0.0001f);
+            near(b.valve_duty, a.valve_duty, 0.005f) && near(b.zero_offset, a.zero_offset, 0.0001f) &&
+            near(b.p_corr, a.p_corr, 0.0f) && near(b.p_comp_assumed, a.p_comp_assumed, 0.01f) &&
+            near(b.leak_rate, a.leak_rate, 0.00005f) && b.leak_pump_on;
+  // Leak model (A34): P_corr rebuilt from P_f and the pump bit.
+  Sample d{};
+  d.p_f = 5.0f;
+  d.leak_pump_on = true;
+  d.p_corr = d.p_f + PUMP_ON_OFFSET;
+  d.p_comp_assumed = NAN;
+  d.leak_rate = NAN;
+  pack(d, &p);
+  unpack(p, 0, &b);
+  ok = ok && b.leak_pump_on && near(b.p_corr, d.p_corr, 0.001f) && isnan(b.p_comp_assumed) &&
+       isnan(b.leak_rate);
+  d.leak_pump_on = false;
+  d.p_corr = d.p_f;
+  d.p_comp_assumed = 999.0f;  // saturates at 32767 / SC_PCOMP = 655.34
+  pack(d, &p);
+  unpack(p, 0, &b);
+  ok = ok && !b.leak_pump_on && near(b.p_corr, 5.0f, 0.001f) &&
+       near(b.p_comp_assumed, 32767.0f / SC_PCOMP, 0.0f);
   // No trip: all trip times 0. Out of range values saturate instead of wrapping.
   Sample c{};
   c.p_raw = 99.0f;

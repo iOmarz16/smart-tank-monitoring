@@ -14,13 +14,14 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
  "replayed":false,"slope":0.0021,"v_gpio_mv":775.3,"sensor_fault":false,"zero_offset":0.1500,
  "zero_forced":false,"trip_decision_us":0,"trip_output_us":0,"t3_us":0,"t3_source":"NONE",
  "led_on":false,"rb_valve_off":false,"rb_pump_off":false,"reset_reason":"POWERON",
- "trip_latched":false,"auto_clears":0}
+ "trip_latched":false,"auto_clears":0,"P_corr":10.1987,"P_comp_assumed":14.62,"leak_rate":0.1437}
 ```
 
-Every sample is stored in the ESP32 ring buffer before it is sent, packed to 44 B (A33). Values
+Every sample is stored in the ESP32 ring buffer before it is sent, packed to 48 B (A33, A34). Values
 therefore arrive **quantized**: `v_gpio_mv` 0.1 mV · `P_raw`, `P_f` 0.002 mbar (range ±65.5) ·
 `slope` 0.001 mbar/s · `t_to_limit` 0.02 s · `u_open`, `valve_duty` 0.01 % · `zero_offset`
-0.0002 mbar. `integ`, `t_esp_ms`, `loop_period_us` and all `*_us` trip times are exact. Control and
+0.0002 mbar · `P_comp_assumed` 0.02 mbar (range ±655) · `leak_rate` 0.0001 mbar/s. `P_corr` is rebuilt
+from `P_f` (same resolution). `integ`, `t_esp_ms`, `loop_period_us` and all `*_us` trip times are exact. Control and
 trips run on the unquantized values.
 
 | Field | Meaning |
@@ -49,6 +50,9 @@ trips run on the unquantized values.
 | `v_gpio_mv` | raw averaged pin voltage at GPIO34 (mean of 32 reads), mV, before any zero offset. `P_raw = v_gpio_mv × 0.015 − zero_offset` (÷5 module, A29). The open-circuit check compares it with `OPEN_CIRCUIT_MV_THRESHOLD` |
 | `trip_latched` | `true` while TRIPPED and only a serial `RESET` can clear the trip. `false` in a SOFT_LIMIT trip that will auto-clear at `P_raw` ≤ 10 (A30), and whenever not tripped |
 | `auto_clears` | SOFT_LIMIT auto-clears in the last 300 s (0–3). An auto-clear shows as `state` TRIPPED → RUN |
+| `P_corr` | **Leak model, display/log only (A34).** mbar(g): `P_f` + 0.19 while the pump ran during the reading (previous loop's pump command); `null` before the first valid sample |
+| `P_comp_assumed` | **ASSUMPTION, not a measurement (A34).** mbar(g): `P_corr` + all pressure assumed lost to the leak since the vessel was last empty (accumulated with the vent energized, weighted by its closed duty; reset with the pump OFF and `P_corr` < 0.05). Grows without bound while the pump runs with the vent closed. Never used for trips, warning, PI, plausibility or the dashboard status, and not evidence for any specification |
+| `leak_rate` | Leak model (A34), mbar/s: `k·√P_corr`, k = 0.045 (pump ON) or 0.28 (pump OFF) mbar^0.5/s; 0 at `P_corr` ≤ 0 |
 
 ### Pong
 `{"type":"pong","t_pc":<echoed>,"t_esp":<ESP32 ms, 3 decimals>}`

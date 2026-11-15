@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "leak_model.h"
 #include "outputs.h"
 #include "readback.h"
 #include "ring.h"
@@ -64,6 +65,9 @@ struct T3Tracker {
 void controlTask(void *) {
   static Supervisor sup(clockUs);
   static T3Tracker t3;
+  // Team leak model (A34): LOG AND DISPLAY ONLY. Its results go into the logged Sample
+  // after sup.step() and are never passed to the supervisor.
+  static leak::Model leak_model;
 
   // Review m6: analogReadMilliVolts() characterizes with the GLOBAL attenuation, not the
   // per-pin one, so set both to 11 dB (they must never differ).
@@ -81,6 +85,10 @@ void controlTask(void *) {
   bool led_state = false;
   uint32_t seq = 0;
   uint32_t prev_start_us = micros();
+  // Outputs written in the previous loop (boot: pump OFF, valve OPEN), i.e. the state
+  // during the step that ends at this loop's reading. Leak model input only.
+  bool model_pump_on = false;
+  float model_closed_duty = 0.0f;
   TickType_t last_wake = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
 
@@ -156,6 +164,15 @@ void controlTask(void *) {
     s.rb_valve_off = READBACK_ENABLED ? readback::valveOff() : false;
     s.rb_pump_off = READBACK_ENABLED ? readback::pumpOff() : false;
     s.reset_reason = g_reset_reason;
+    // Leak model (A34), display/log only: computed from the logged P_f AFTER the
+    // supervisor has decided this step, so it cannot influence trips, warning or PI.
+    const leak::Result lr = leak_model.update(s.p_f, model_pump_on, model_closed_duty);
+    s.p_corr = lr.p_corr;
+    s.p_comp_assumed = lr.p_comp;
+    s.leak_rate = lr.leak_rate;
+    s.leak_pump_on = model_pump_on;
+    model_pump_on = o.pump_on;
+    model_closed_duty = o.valve_safe ? 0.0f : o.valve_duty;
     prev_start_us = start_us;
     ring::push(s);
 

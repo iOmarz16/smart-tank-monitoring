@@ -84,7 +84,7 @@ Do not change pins, thresholds, gains or timings without team approval.
   does not reset the board (verified on the real DevKit). Other serial programs may still reset it.
 - At boot the console prints `HEAP ...` lines: free heap, largest free block and minimum free
   heap, before and after the ring buffer, before Wi-Fi and after Wi-Fi + WebSocket. The ring holds
-  1500 samples packed at 44 B each, in 10 blocks. If less than 40 KB is free after Wi-Fi, a
+  1500 samples packed at 48 B each (72 KB), in 10 blocks. If less than 40 KB is free after Wi-Fi, a
   `WARNING` line follows: report the HEAP lines and do not run tests. `FATAL ring buffer
   allocation failed` still stops the controller with the outputs safe.
 - At boot the console prints `reset_reason=...`. After `TASK_WDT`, `INT_WDT`, `PANIC`, `WDT` or

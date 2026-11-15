@@ -19,7 +19,9 @@ class PressureChart {
 
   // Insert keeping seq order (replayed samples can arrive late).
   add(s) {
-    const p = { seq: s.seq, t: s.t_esp_ms, pf: s.P_f, raw: s.P_raw, valid: s.valid };
+    // comp = P_comp_assumed (A34): an ASSUMED no-leak estimate, drawn for reference only.
+    const p = { seq: s.seq, t: s.t_esp_ms, pf: s.P_f, raw: s.P_raw, valid: s.valid,
+                comp: s.P_comp_assumed };
     const d = this.data;
     if (!d.length || d[d.length - 1].seq < p.seq) d.push(p);
     else {
@@ -55,6 +57,9 @@ class PressureChart {
     const newest = d.length ? d[d.length - 1].t : 0;
     const x0 = newest - this.windowMs;
 
+    // The y range follows the MEASURED pressure only. P_comp_assumed can grow far above
+    // it (it keeps rising while the pump runs with the vent closed); letting it rescale
+    // the axis would squash the real pressure, so above the axis it is simply clipped.
     let ymin = 0, ymax = 32;
     for (const p of d) {
       for (const v of [p.pf, p.raw]) {
@@ -97,13 +102,15 @@ class PressureChart {
     g.setLineDash([]);
 
     // series; break the line on gaps (missing seq) and on invalid samples
-    const series = (key, color, width) => {
+    const series = (key, color, width, dash = []) => {
       g.strokeStyle = this.css(color); g.lineWidth = width; g.lineJoin = "round";
+      g.setLineDash(dash);
       g.beginPath();
       let pen = false, prevSeq = -2;
       for (const p of d) {
         const v = p[key];
-        const ok = v != null && (key === "pf" || p.valid);
+        // P_f (and P_comp, which is built on P_f) are held while invalid; P_raw breaks.
+        const ok = v != null && (key !== "raw" || p.valid);
         if (!ok || p.seq !== prevSeq + 1) pen = false;
         prevSeq = p.seq;
         if (!ok) continue;
@@ -112,9 +119,11 @@ class PressureChart {
         pen = true;
       }
       g.stroke();
+      g.setLineDash([]);
     };
     g.save();
     g.beginPath(); g.rect(L, T, pw, ph); g.clip();
+    series("comp", "--comp", 1.5, [5, 4]);  // A34: assumed, drawn first (under the measured lines)
     series("raw", "--raw", 1);
     series("pf", "--pf", 2.2);
     g.restore();

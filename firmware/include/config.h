@@ -142,6 +142,24 @@ constexpr int WARN_CONFIRM_SAMPLES = 3;       // consecutive samples for the slo
 constexpr int SLOPE_WINDOW = 5;               // 5-sample linear regression
 
 // ---------------------------------------------------------------------------
+// Team leak model (docs/rig_corrections.h, A34) - LOG AND DISPLAY ONLY
+// ---------------------------------------------------------------------------
+// NEVER used by the trips, the warning, the PI or the plausibility checks: those run on
+// the measured P_raw / P_f only (tools/check_rules.py enforces this). Computed once per
+// loop by the control task (src/leak_model.h) and logged as P_corr, P_comp_assumed and
+// leak_rate. Leak law dP/dt = -k * sqrt(P). The per-step loss uses TS_S = 0.1 s (the team
+// file uses 0.2 s, its log period; keeping 0.2 here would double P_comp). The k values
+// are per second and the offset is per reading, so they do not depend on the period.
+// Measured 2026-11-15, provisional until the ADC-floor zero check.
+constexpr float PUMP_ON_OFFSET = 0.19f;   // mbar, reading is this much low while the pump runs
+// Measured 2026-11-15, provisional until the ADC-floor zero check.
+constexpr float K_LEAK_PUMP_ON = 0.045f;  // mbar^0.5/s, pot leak only (test B, needle valve closed)
+// Measured 2026-11-15, provisional until the ADC-floor zero check.
+constexpr float K_LEAK_PUMP_OFF = 0.28f;  // mbar^0.5/s, pot leak + backflow through the pump (test A)
+// Measured 2026-11-15, provisional until the ADC-floor zero check (team value, rig_corrections.h).
+constexpr float P_COMP_RESET_P = 0.05f;   // mbar(g): P_comp resets when pump OFF and P_corr < this
+
+// ---------------------------------------------------------------------------
 // Communication (Section 3 of the brief). Local AP only, no Internet (Constraint 4).
 // ---------------------------------------------------------------------------
 #define WIFI_AP_SSID "M021-RIG"
@@ -155,8 +173,8 @@ constexpr uint16_t WS_PORT = 81;
 // Ring buffer: >= 1200 samples (>= 120 s at 10 Hz). 1500 = 150 s. Never below 900
 // (60 s Wi-Fi outage + margin) without asking the team (A33).
 constexpr uint32_t RING_SAMPLES = 1500;
-// Memory fix (A33): stored packed (44 B/sample) in separate blocks of this many samples,
-// because the heap has no single free block for the whole buffer. 150 x 44 B = 6.6 KB.
+// Memory fix (A33): stored packed (48 B/sample since A34) in separate blocks of this many samples,
+// because the heap has no single free block for the whole buffer. 150 x 48 B = 7.2 KB.
 constexpr uint32_t RING_CHUNK_SAMPLES = 150;
 // Free heap that must remain once Wi-Fi and the WebSocket server are up (A33). Checked
 // and printed at boot; below it the console prints a WARNING.

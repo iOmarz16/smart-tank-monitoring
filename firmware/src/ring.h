@@ -8,7 +8,7 @@
 #include "types.h"
 
 namespace ring {
-// Samples are stored packed (44 B, quantized: see ring.cpp and docs/protocol.md) in
+// Samples are stored packed (48 B, quantized: see ring.cpp and docs/protocol.md) in
 // RING_SAMPLES / RING_CHUNK_SAMPLES separate allocations (A33).
 bool init();                       // allocates RING_SAMPLES samples; false = failed (all freed)
 size_t bytes();                    // heap used by the buffer
