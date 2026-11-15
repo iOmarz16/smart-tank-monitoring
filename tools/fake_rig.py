@@ -382,7 +382,11 @@ class Rig:
         next_t = time.perf_counter()
         while True:
             next_t += period
-            await asyncio.sleep(max(0.0, next_t - time.perf_counter()))
+            # Windows timers are ~15.6 ms coarse: sleep most of the way, then spin,
+            # so the fake loop period is as steady as the ESP32's vTaskDelayUntil.
+            await asyncio.sleep(max(0.0, next_t - time.perf_counter() - 0.02))
+            while time.perf_counter() < next_t:
+                pass
             now_us = self.clock_us()
             t = time.perf_counter() - self.t0
             self.scenario(t)
