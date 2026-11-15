@@ -103,7 +103,8 @@ class Supervisor {
   // TEST mode
   bool test_pump_ = false;
   uint64_t test_pump_since_us_ = 0;  // last TEST PUMP ON
-  bool test_pump_timeout_ = false;   // pump switched OFF by TEST_PUMP_MAX_S
+  uint32_t test_pump_duration_s_ = 0;  // requested ON time, 1..TEST_PUMP_MAX_S
+  bool test_pump_timeout_ = false;   // pump switched OFF at the end of its duration
   float test_duty_ = 0.0f;
 
   uint64_t t0_us_ = 0;

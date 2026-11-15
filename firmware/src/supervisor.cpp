@@ -352,9 +352,18 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
         return;
       }
       if (cmd.type == CmdType::TEST_PUMP) {
+        // A26: ON runs the pump for cmd.arg seconds (1..TEST_PUMP_MAX_S), then auto-OFF.
+        // Checked again here so no path can run the pump longer than the hard cap.
+        if (cmd.arg < 0 || cmd.arg > (int)TEST_PUMP_MAX_S) {
+          r->code = ReplyCode::ERR_TEST_DURATION;
+          return;
+        }
         test_pump_ = cmd.arg != 0;
-        // Every TEST PUMP ON (re)starts the TEST_PUMP_MAX_S window (review M1).
-        if (test_pump_) test_pump_since_us_ = now_us;
+        if (test_pump_) {
+          // A new ON replaces the remaining time (it does not add to it).
+          test_pump_since_us_ = now_us;
+          test_pump_duration_s_ = (uint32_t)cmd.arg;
+        }
         test_pump_timeout_ = false;
       }
       if (cmd.type == CmdType::TEST_VALVE) test_duty_ = cmd.arg ? 100.0f : 0.0f;
@@ -362,6 +371,7 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       r->code = ReplyCode::OK_TEST_SET;
       r->flag = test_pump_;
       r->value = test_duty_;
+      r->count = test_pump_ ? (int)test_pump_duration_s_ : 0;
       return;
     case CmdType::TEST_EXIT:
       if (state_ == State::TEST) {
@@ -449,8 +459,9 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
       o.pump_on = pump_allowed_in_trip_;
       break;
     case State::TEST:
-      // Review M1: the pump turns OFF by itself after TEST_PUMP_MAX_S.
-      if (test_pump_ && (now_us - test_pump_since_us_) > (uint64_t)TEST_PUMP_MAX_S * 1000000ULL) {
+      // Review M1 / A26: the pump turns OFF by itself after the requested duration.
+      if (test_pump_ &&
+          (now_us - test_pump_since_us_) > (uint64_t)test_pump_duration_s_ * 1000000ULL) {
         test_pump_ = false;
         test_pump_timeout_ = true;
       }

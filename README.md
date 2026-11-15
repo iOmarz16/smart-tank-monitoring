@@ -95,7 +95,7 @@ Serial commands (type and press Enter):
 | `LED MODE SAMPLE` | any | GPIO2 LED toggles at t0 of every sample (I1 video) |
 | `LED MODE VENT` | any | GPIO2 LED ON while the vent is commanded fully open (I6b video). **Default at boot** |
 | `TEST` | IDLE | test mode, outputs under manual control, **trip limits still active** |
-| `TEST PUMP ON` / `OFF` | TEST | pump. **Auto-OFF after 60 s** (`EVENT TEST pump OFF`); sending `TEST PUMP ON` again restarts the 60 s without stopping the pump |
+| `TEST PUMP ON [<s>]` / `OFF` | TEST | pump ON for `<s>` seconds (default 60, **max 300**; more is refused), then **auto-OFF** (`EVENT TEST pump OFF`). A new `TEST PUMP ON` replaces the remaining time. All trips and the open-circuit check stay enforced |
 | `TEST VALVE ENERGIZE` / `RELEASE` | TEST | valve closed / open |
 | `TEST DUTY <0-100>` | TEST | valve energized (closed) duty %, 10 Hz PWM |
 | `TEST EXIT` | TEST | back to IDLE |
@@ -258,7 +258,10 @@ which needs 60 s in IDLE). `--no-autostart` stays in IDLE; `--zero-error 3.6` si
 sensor offset to try `ZERO FORCE`; `--adc-floor-mv 120` models the ESP32 ADC floor.
 `--scenario open_circuit --adc-floor-mv 120` shows the wire-broken-at-start case: the reading
 looks vented while the true pressure rises, until the open-circuit check trips after 30 s.
-It is a test tool, not a validated model. Its own Python loop can stretch a few loop periods while
+It is a test tool, not a validated model.
+`python tools/check_rules.py` (e.g. `dashboard\.venv\Scripts\python tools\check_rules.py`) runs the
+regression checks of the review rules (START gate, ZERO rules, open-circuit trip). They test the
+simulator's copy of the logic in `fake_rig.py`, **not the C++ firmware**. Its own Python loop can stretch a few loop periods while
 it replays after a reconnect, so `analyze_log.py` may report I2 FAIL on fake-rig logs; that says
 nothing about the ESP32.
 
@@ -278,9 +281,9 @@ run in TEST mode: `TEST`, `TEST VALVE ENERGIZE`, `TEST PUMP ON`, FI-101 set to 1
 trip at 20 mbar(g) is still enforced in TEST and latches. **The trip does not re-close the vent
 automatically** (HYSYS T3 does; the firmware latches, by decision Q1). After the vent has brought P
 below 20 mbar(g), type `RESET` on the serial console to return to IDLE.
-The TEST pump turns OFF after 60 s: at 148 std cm³/min (≈ 28 mbar/min) the trip comes after about
-42 s, inside the window. For slower ramps (P2 at 10 mbar/min needs ~120 s to 20 mbar(g)), send
-`TEST PUMP ON` again before each 60 s runs out; that restarts the window without stopping the pump.
+The TEST pump turns OFF after the requested time (`TEST PUMP ON` = 60 s): at 148 std cm³/min
+(≈ 28 mbar/min) the trip comes after about 42 s, inside the default. For slower ramps give a
+duration: P2 at 10 mbar/min needs ~120 s to 20 mbar(g), so use `TEST PUMP ON 180` (max 300).
 
 | Test | Procedure | Pass criterion | Tool output |
 |---|---|---|---|
@@ -303,8 +306,10 @@ Then `RESET` once P < 20, `START` again, and unplug the supply at 15 mbar(g): th
 
 - **O3** `PUMP_OFF_AT_SOFT_LIMIT = true` (Spec 6) vs Table D (pump off only at 29): kept until CHE confirms.
 - `OPEN_CIRCUIT_MV_THRESHOLD` is provisional until the bench measurement of section 3.3.
-- P2 at 10 mbar/min with the 60 s TEST pump limit (re-send `TEST PUMP ON`), and P1 at 25 mbar(g)
-  vs the 20 mbar(g) trip enforced in TEST: team decisions pending (`docs/assumptions.md`, E).
+- **P1 is blocked pending CHE**: it holds 25 mbar(g), above the 20 mbar(g) trip that is enforced in
+  every state, and there is no passive relief. The firmware has no mode that raises or bypasses the
+  limit; CHE is asked to run the leak test below 20 mbar(g) (`docs/assumptions.md`, E).
+- `monitor_dtr = 0` / `monitor_rts = 0` (m5): check on the real DevKit that opening the monitor does not reset it.
 - The MOSFET modules' low-side switching (section 3.1, step 1) must be confirmed with a multimeter
   before the read-back is wired.
 - Nothing here has run on the real ESP32 yet.

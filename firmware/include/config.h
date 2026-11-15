@@ -155,9 +155,11 @@ constexpr uint32_t REPLAY_RATE_HZ = 100;  // replayed samples per second, per cl
 // ---------------------------------------------------------------------------
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t TEST_PRINT_PERIOD_MS = 200;  // 5 Hz in TEST mode
-// TEST mode: the pump turns OFF automatically after this long ON (review M1).
-// Sending TEST PUMP ON again restarts the window (deliberate operator confirmation).
-constexpr uint32_t TEST_PUMP_MAX_S = 60;
+// TEST mode: TEST PUMP ON [<seconds>] runs the pump for that long, then it turns OFF by
+// itself (review M1, A26). No argument = TEST_PUMP_DEFAULT_S. Durations above
+// TEST_PUMP_MAX_S (or below 1 s) are refused. Trips and the open-circuit check stay enforced.
+constexpr uint32_t TEST_PUMP_DEFAULT_S = 60;
+constexpr uint32_t TEST_PUMP_MAX_S = 300;  // hard cap (user decision)
 constexpr int ZERO_AVERAGE_SAMPLES = 10;        // ZERO averages the last 1 s of IDLE samples
 // ZERO is refused if the measured offset is larger than this (10 % of full scale):
 // the vessel is probably not vented, or the range jumper is wrong. (A13, user-approved)

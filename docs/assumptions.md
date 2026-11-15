@@ -101,17 +101,15 @@ settles near 4 mbar(g) ≈ 310 mV, close to the provisional threshold).
 - MOSFET module polarity (low-side) to be measured before the read-back is wired (A18).
 - **A25** `OPEN_CIRCUIT_MV_THRESHOLD = 250` mV is provisional: set it from the bench open-circuit
   measurement (README 3.3) before any pressurized run.
-- **A26 vs P2** — Table G P2 runs the vent-closed ramp "as T1" at 10 / 20 / 30 mbar/min. With the
-  vent closed the PI cannot be used, so P2 runs in TEST, where the pump now stops after
-  `TEST_PUMP_MAX_S` = 60 s. At 10 mbar/min, 60 s covers only 10 mbar. Re-sending `TEST PUMP ON`
-  within the 60 s restarts the window without interrupting the pump (A26), so P2 is still possible,
-  but the operator must re-confirm every minute. Team to confirm that this is acceptable, or
-  approve a different limit.
-- **P1 vs the 20 mbar(g) trip** (found during review, no code change) — Table G P1 holds 25 mbar(g),
-  vent closed, pump off, for 10 min. The soft trip at 20 mbar(g) is enforced in every state, TEST
-  included, and latches with the vent open, so P1 cannot reach 25 mbar(g) with this firmware.
-  Needs a team decision (e.g. run P1 at a pressure below 20 mbar(g), or a separate, approved
-  procedure). Not changed.
+- ~~A26 vs P2~~ resolved (user, 2026-11-15): `TEST PUMP ON <seconds>`, see A26. P2 at
+  10 mbar/min (~120 s to 20 mbar(g)) runs with one command, e.g. `TEST PUMP ON 180`.
+- **P1 BLOCKED pending CHE** (user decision, 2026-11-15) — Table G P1 holds 25 mbar(g), vent closed,
+  pump off, for 10 min. The soft trip at 20 mbar(g) is enforced in every state, TEST included, and
+  latches with the vent open, so P1 cannot reach 25 mbar(g). There is no passive relief on the
+  prototype (C10). **No mode, flag or command will be added that raises or bypasses the 20 mbar(g)
+  limit.** The team asks CHE to run the leak test below 20 mbar(g); P1 stays blocked until they answer.
+- m5 DTR/RTS: verify on the real DevKit at bring-up that opening the monitor does not reset it (A28).
+- Interrupt watchdog path not hooked (A27); accepted for now, revisit only if bring-up shows a need.
 
 ## F. Additions (answers of 2026-11-15, second round)
 
@@ -130,7 +128,7 @@ counted it as a layer was wrong and is corrected here.
 |---|---|---|
 | A24 | `START` is refused unless a **valid, non-forced zero exists in NVS**. Valid at boot = key `zero` present, `zforced` false, finite, \|zero\| ≤ 3.0 mbar (`ZERO_MAX_ABS_OFFSET`). In a session, a normal `ZERO` sets it, `ZERO FORCE` clears it. The serial task writes the zero to NVS and reads it back; if that fails it tells the control task (`ZERO_UNSAVED`), which clears it again, so an offset that is active in RAM but not saved does not allow `START`. | CONFIRMED (user, review C1) |
 | A25 | `OPEN_CIRCUIT_MV_THRESHOLD` = 250 mV, **provisional**, to be set to the bench open-circuit maximum + margin, ≤ ~350 mV (section C). | OPEN (bench measurement) |
-| A26 | TEST pump limit `TEST_PUMP_MAX_S` = 60 s: after 60 s ON the control task switches the pump OFF and the serial console prints `EVENT TEST pump OFF`. **Every `TEST PUMP ON` restarts the 60 s window**, also while the pump is already ON: a deliberate operator confirmation, which keeps the slow P2 ramp possible (see E). The open-circuit check runs independently of this window. | Limit CONFIRMED (user); restart rule ASSUMED |
+| A26 | TEST pump duration: `TEST PUMP ON [<seconds>]`, default `TEST_PUMP_DEFAULT_S` = 60 s, hard cap `TEST_PUMP_MAX_S` = 300 s. A duration < 1 or > 300 s is refused (`ERR`, pump unchanged); the supervisor checks the range again itself. When the time is up the control task switches the pump OFF and the console prints `EVENT TEST pump OFF`. All trips and the open-circuit check stay enforced. Replaces the earlier "every `TEST PUMP ON` restarts a 60 s window" rule. A new `TEST PUMP ON` while the pump is ON **replaces** the remaining time (does not add), so one command never runs the pump longer than 300 s. | Duration argument, default and cap CONFIRMED (user, 2026-11-15); replace-not-add ASSUMED |
 | A27 | Watchdog freeze path (review M2). (a) `esp_task_wdt_isr_user_handler()` (weak hook in IDF 4.4.7 `libesp_system.a`; disassembly shows it is called after the task-name prints and before `abort()`) routes GPIO26 back from LEDC to the GPIO register and clears GPIO26/27. ROM function + register writes only, IRAM. It fires for every watched task (control task; core-0 idle task). (b) `partitions_nocoredump.csv` = Arduino `default.csv` without the 64 KB coredump partition (sdkconfig has `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`), so a panic does not write flash before rebooting; other offsets unchanged, the NVS survives the re-flash. Not covered by the hook: the **interrupt watchdog** (300 ms, interrupts disabled for too long) and other panics go straight to the panic handler (backtrace over UART, ~tens of ms, then reboot), with outputs held until the reset. | CONFIRMED (user, review M2) |
 | A28 | m2: when the valve LEDC pin is detached, the channel is parked at 0 % duty, so a later re-attach starts OPEN (`ledcAttachPin` re-applies the channel's current duty for up to one 100 ms period). m3: `esp_reset_reason()` is printed at boot (with a warning after a watchdog, panic or brownout reset, because the RAM trip latch is lost) and sent in every sample as `reset_reason`. m5: `monitor_dtr = 0` / `monitor_rts = 0`, so opening the PlatformIO monitor does not reset the board (to verify on the real DevKit; other serial programs may still toggle DTR/RTS). m6: `analogSetAttenuation(ADC_11db)` sets the global attenuation that `analogReadMilliVolts` characterizes with, as well as the per-pin one. m9: commands carry an id; a reply that arrives after the 1 s timeout is printed as `LATE` and still processed (a late `ZERO` is still saved); all reply text, including `STATUS`, is formatted by the serial task, so the control task no longer formats floats; `STATUS` adds V_gpio, zero_ok, idle time and the stack high-water marks (control, net, serial). | CONFIRMED (user) |
 

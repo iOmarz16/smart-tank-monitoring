@@ -43,7 +43,7 @@ struct Sample {
   bool rb_valve_off;  // read-back: valve MOSFET OFF (only if READBACK_ENABLED)
   bool rb_pump_off;   // read-back: pump MOSFET OFF (only if READBACK_ENABLED)
   uint8_t reset_reason;    // esp_reset_reason() at boot (same value in every sample)
-  bool test_pump_timeout;  // internal (not in the JSON): TEST pump switched OFF by TEST_PUMP_MAX_S
+  bool test_pump_timeout;  // internal (not in the JSON): TEST pump switched OFF at the end of its duration
 };
 
 // Commands from the serial task to the control task. Only the control task
@@ -55,7 +55,7 @@ enum class CmdType : uint8_t {
   RESET,
   STATUS,
   TEST_ENTER,
-  TEST_PUMP,    // arg 0/1
+  TEST_PUMP,    // arg 0 = OFF, 1..TEST_PUMP_MAX_S = ON for that many s, < 0 = invalid duration
   TEST_VALVE,   // arg 0 = release (open), 1 = energize (closed)
   TEST_DUTY,    // arg 0..100 = energized (closed) duty %
   TEST_EXIT,
@@ -98,7 +98,8 @@ enum class ReplyCode : uint8_t {
   ERR_TEST_STATE,      // state
   OK_TEST,
   ERR_NOT_TEST,
-  OK_TEST_SET,         // flag = pump, value = duty
+  OK_TEST_SET,         // flag = pump, value = duty, count = pump duration s (when ON)
+  ERR_TEST_DURATION,   // TEST PUMP ON duration outside 1..TEST_PUMP_MAX_S; pump unchanged
   OK_TEST_EXIT,
   ERR_TEST_EXIT,
 };

@@ -1,6 +1,6 @@
 // Serial task: core 0, low priority. Operator-only commands over USB (115200).
 //   ZERO [FORCE] | START | STOP | RESET | STATUS | LED MODE SAMPLE|VENT
-//   TEST | TEST PUMP ON|OFF | TEST VALVE ENERGIZE|RELEASE | TEST DUTY <0-100> | TEST EXIT
+//   TEST | TEST PUMP ON [<s>]|OFF | TEST VALVE ENERGIZE|RELEASE | TEST DUTY <0-100> | TEST EXIT
 // Commands are queued to the control task, which owns all state and outputs.
 // All reply text is formatted here (core 0), never in the control task (review m9).
 #include <Arduino.h>
@@ -22,6 +22,7 @@ static bool parse(char *line, Command *cmd) {
   char *t1 = strtok(line, " \t");
   char *t2 = strtok(nullptr, " \t");
   char *t3 = strtok(nullptr, " \t");
+  char *t4 = strtok(nullptr, " \t");
   if (!t1) return false;
   cmd->arg = 0;
   if (!strcmp(t1, "ZERO")) {
@@ -49,9 +50,21 @@ static bool parse(char *line, Command *cmd) {
   if (!t3) return false;
   if (!strcmp(t2, "PUMP")) {
     cmd->type = CmdType::TEST_PUMP;
-    if (!strcmp(t3, "ON")) cmd->arg = 1;
-    else if (!strcmp(t3, "OFF")) cmd->arg = 0;
-    else return false;
+    if (!strcmp(t3, "OFF")) {
+      if (t4) return false;
+      cmd->arg = 0;
+      return true;
+    }
+    if (strcmp(t3, "ON")) return false;
+    if (!t4) {
+      cmd->arg = (int)TEST_PUMP_DEFAULT_S;
+      return true;
+    }
+    char *end = nullptr;
+    const long v = strtol(t4, &end, 10);
+    if (!end || *end) return false;
+    // Out-of-range durations go to the supervisor as -1: it refuses them with a reply.
+    cmd->arg = (v >= 1 && v <= (long)TEST_PUMP_MAX_S) ? (int)v : -1;
     return true;
   }
   if (!strcmp(t2, "VALVE")) {
@@ -73,8 +86,10 @@ static bool parse(char *line, Command *cmd) {
 }
 
 static void printHelp() {
-  Serial.println(F("Commands: ZERO [FORCE], START, STOP, RESET, STATUS, LED MODE SAMPLE|VENT | "
-                   "TEST, TEST PUMP ON|OFF, TEST VALVE ENERGIZE|RELEASE, TEST DUTY <0-100>, TEST EXIT"));
+  Serial.printf("Commands: ZERO [FORCE], START, STOP, RESET, STATUS, LED MODE SAMPLE|VENT | "
+                "TEST, TEST PUMP ON [<1-%lu s, default %lu>]|OFF, TEST VALVE ENERGIZE|RELEASE, "
+                "TEST DUTY <0-100>, TEST EXIT\n",
+                (unsigned long)TEST_PUMP_MAX_S, (unsigned long)TEST_PUMP_DEFAULT_S);
 }
 
 static void formatReply(const Reply &r, char *out, size_t n) {
@@ -177,8 +192,9 @@ static void formatReply(const Reply &r, char *out, size_t n) {
       return;
     case ReplyCode::OK_TEST:
       snprintf(out, n,
-               "OK TEST (trip limits and open-circuit check still enforced; pump auto-OFF after %lu s)",
-               (unsigned long)TEST_PUMP_MAX_S);
+               "OK TEST (trip limits and open-circuit check still enforced; TEST PUMP ON [<s>] "
+               "runs the pump %lu s by default, max %lu s)",
+               (unsigned long)TEST_PUMP_DEFAULT_S, (unsigned long)TEST_PUMP_MAX_S);
       return;
     case ReplyCode::ERR_NOT_TEST:
       snprintf(out, n, "ERR not in TEST mode (send TEST first)");
@@ -186,12 +202,15 @@ static void formatReply(const Reply &r, char *out, size_t n) {
     case ReplyCode::OK_TEST_SET:
       if (r.flag) {
         snprintf(out, n,
-                 "OK TEST pump=ON (auto-OFF in %lu s; TEST PUMP ON again restarts it) "
-                 "valve_duty(energized)=%.0f%%",
-                 (unsigned long)TEST_PUMP_MAX_S, (double)r.value);
+                 "OK TEST pump=ON for %d s (then auto-OFF) valve_duty(energized)=%.0f%%",
+                 r.count, (double)r.value);
       } else {
         snprintf(out, n, "OK TEST pump=OFF valve_duty(energized)=%.0f%%", (double)r.value);
       }
+      return;
+    case ReplyCode::ERR_TEST_DURATION:
+      snprintf(out, n, "ERR TEST PUMP ON duration must be 1-%lu s (pump unchanged)",
+               (unsigned long)TEST_PUMP_MAX_S);
       return;
     case ReplyCode::OK_TEST_EXIT:
       snprintf(out, n, "OK IDLE");
@@ -329,8 +348,8 @@ void serialTask(void *) {
         last_reason = s.trip_reason;
       }
       if (s.test_pump_timeout && !last_pump_timeout) {
-        Serial.printf("EVENT TEST pump OFF: %lu s limit reached (TEST PUMP ON restarts it) seq=%lu\n",
-                      (unsigned long)TEST_PUMP_MAX_S, (unsigned long)s.seq);
+        Serial.printf("EVENT TEST pump OFF: requested duration reached seq=%lu\n",
+                      (unsigned long)s.seq);
       }
       last_pump_timeout = s.test_pump_timeout;
       // TEST mode: 5 Hz live print.
