@@ -14,9 +14,14 @@ Scenarios:
                  the block is released when the trip fires so the vent can act
     sensor_loss  hold at 10; PT-101 wire breaks at 60 s (reads 0 V), restored at 90 s
     wifi_outage  hold at 10; every client dropped and refused from 60 s for 60 s
+    open_circuit PT-101 wire broken from boot (review C1): START is accepted (the
+                 reading looks like a vented vessel) and the open-circuit check trips
+                 SENSOR_LOSS 30 s later. Try it with --adc-floor-mv 120
 
 Console (stdin) commands, like the USB serial port: ZERO [FORCE] START STOP RESET STATUS,
-LED MODE SAMPLE|VENT.
+LED MODE SAMPLE|VENT. TEST mode is not simulated.
+The simulated NVS holds a valid zero of 0.000 mbar at start (START allowed); use
+--fresh-nvs to start like a first flash (START refused until ZERO).
 This is a test tool: it is NOT a verified model of the rig.
 """
 
@@ -81,8 +86,12 @@ NAN = float("nan")
 class Supervisor:
     zero_offset: float = 0.0
     zero_forced: bool = False
+    zero_ok: bool = False          # valid non-forced zero in (simulated) NVS
     state: str = "BOOT"
+    idle_since_us: int = 0
     reason: str = "NONE"
+    read_ok: bool = False
+    v_mv: float = 0.0
     pump_allowed_in_trip: bool = False
     trip_new: bool = False
     trip_decision_us: int = 0
@@ -111,14 +120,27 @@ class Supervisor:
     valve_duty: float = 0.0
     pump_on: bool = False
 
-    def begin(self, now_us: int) -> None:
+    def begin(self, now_us: int, zero_ok: bool) -> None:
+        self.zero_ok = zero_ok and not self.zero_forced
         self.last_valid_us = now_us
+        self.set_state("BOOT", now_us)
+
+    def set_state(self, s: str, now_us: int) -> None:
+        # Every state change restarts the IDLE dwell and clears the ZERO window.
+        if s != self.state or s == "BOOT":
+            self.idle_since_us = now_us
+            self.zero_hist.clear()
+        self.state = s
 
     def stale(self, now_us: int) -> bool:
         return now_us - self.last_valid_us > C["SENSOR_TIMEOUT_MS"] * 1000
 
     def validate(self, now_us: int, v_mv: float, read_ok: bool) -> None:
         self.valid = False
+        self.read_ok, self.v_mv = read_ok, v_mv
+        # ZERO window: consecutive valid IDLE samples only.
+        kept = list(self.zero_hist)
+        self.zero_hist.clear()
         if not read_ok:
             self.p_raw = NAN
             self.reref_count = 0
@@ -152,7 +174,9 @@ class Supervisor:
         self.has_ref = True
         self.last_valid_p = p
         self.last_valid_us = now_us
-        self.zero_hist.append(p_uncorr)
+        if self.state == "IDLE":
+            self.zero_hist.extend(kept)
+            self.zero_hist.append(p_uncorr)
         if not self.pf_init:
             self.p_f, self.pf_init = p, True
         else:
@@ -188,31 +212,44 @@ class Supervisor:
         if cmd in ("ZERO", "ZERO FORCE"):
             if self.state != "IDLE":
                 return f"ERR ZERO only in IDLE, state={self.state}"
+            idle_s = (now_us - self.idle_since_us) / 1e6
+            if idle_s < C["ZERO_MIN_IDLE_S"]:
+                return f"ERR ZERO needs {C['ZERO_MIN_IDLE_S']} s in IDLE; {idle_s:.0f} s so far"
             if not ok or len(self.zero_hist) < C["ZERO_AVERAGE_SAMPLES"]:
-                return "ERR ZERO needs valid samples"
+                return "ERR ZERO needs consecutive valid IDLE samples"
+            spread = max(self.zero_hist) - min(self.zero_hist)
+            if spread > C["ZERO_MAX_SPREAD"]:
+                return f"ERR ZERO window not steady: max-min {spread:.3f} > {C['ZERO_MAX_SPREAD']}"
             z = sum(self.zero_hist) / len(self.zero_hist)
+            if not abs(z) <= C["ZERO_FORCE_MAX_ABS_OFFSET"]:
+                return f"ERR ZERO offset {z:.3f} exceeds the absolute cap (FORCE cannot override)"
             beyond = abs(z) > C["ZERO_MAX_ABS_OFFSET"]
             if beyond and cmd != "ZERO FORCE":
                 return f"ERR ZERO offset {z:.3f} too large (ZERO FORCE overrides)"
             self.zero_offset = z
             self.zero_forced = beyond
+            self.zero_ok = not beyond
             self.has_ref = self.pf_init = False
             self.win.clear()
             self.warn_confirm = 0
             self.zero_hist.clear()
             if beyond:
-                return f"WARN ZERO FORCE offset={z:.3f} mbar exceeds limit; zero_forced logged"
+                return f"WARN ZERO FORCE offset={z:.3f} mbar exceeds limit; zero_forced logged; START refused"
             return f"OK ZERO offset={z:.3f} mbar"
         if cmd == "START":
             if self.state != "IDLE":
                 return f"ERR START only from IDLE, state={self.state}"
             if not ok:
                 return "ERR START needs a valid sensor sample"
-            self.state, self.integ, self.plaus_low_since_us = "RUN", 0.0, 0
+            if not self.zero_ok:
+                why = "zero set with ZERO FORCE" if self.zero_forced else "no valid ZERO saved in NVS"
+                return f"ERR START refused: {why}"
+            self.set_state("RUN", now_us)
+            self.integ, self.plaus_low_since_us = 0.0, 0
             return "OK RUN"
         if cmd == "STOP":
             if self.state in ("RUN", "TEST"):
-                self.state = "IDLE"
+                self.set_state("IDLE", now_us)
                 return "OK IDLE"
             if self.state == "TRIPPED":
                 return f"ERR trip latched ({self.reason}): use RESET"
@@ -224,26 +261,30 @@ class Supervisor:
                 return "ERR RESET refused: sensor not valid"
             if not self.p_raw < C["RESET_MAX_PRESSURE"]:
                 return f"ERR RESET refused: P={self.p_raw:.2f}"
-            self.state, self.reason = "IDLE", "NONE"
+            self.set_state("IDLE", now_us)
+            self.reason = "NONE"
             self.pump_allowed_in_trip = False
             self.trip_decision_us = self.trip_output_us = 0
             return "OK RESET -> IDLE"
         if cmd == "STATUS":
             return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} "
-                    f"P_f={self.p_f:.3f} u_open={self.u_open:.1f} integ={self.integ:.3f}")
+                    f"P_f={self.p_f:.3f} V_gpio={self.v_mv:.1f}mV u_open={self.u_open:.1f} "
+                    f"integ={self.integ:.3f} zero={self.zero_offset:.3f} zero_ok={int(self.zero_ok)}")
         return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS LED MODE)"
 
     def enter_trip(self, r: str, clock_us: int) -> None:
         was_on = self.pump_on
-        self.state, self.reason, self.trip_new = "TRIPPED", r, True
+        self.set_state("TRIPPED", clock_us)
+        self.reason, self.trip_new = r, True
         self.trip_decision_us, self.trip_output_us = clock_us, 0
         self.pump_allowed_in_trip = (not C["PUMP_OFF_AT_SOFT_LIMIT"]) and r == "SOFT_LIMIT" and was_on
 
     def evaluate_trip(self, now_us: int, clock_us: int) -> None:
+        # Open-circuit check: raw pin mV, armed whenever the pump is commanded ON (any state).
         plaus_fail = False
-        if self.state == "RUN" and self.pump_on:
-            if self.valid:
-                if self.p_raw < C["PLAUS_MIN_PRESSURE"]:
+        if self.pump_on:
+            if self.read_ok:
+                if self.v_mv < C["OPEN_CIRCUIT_MV_THRESHOLD"]:
                     if self.plaus_low_since_us == 0:
                         self.plaus_low_since_us = now_us
                 else:
@@ -293,7 +334,7 @@ class Supervisor:
         self.trip_new = False
         self.validate(now_us, v_mv, read_ok)
         if self.state == "BOOT" and self.valid:
-            self.state = "IDLE"
+            self.set_state("IDLE", now_us)
         reply = self.execute(cmd, now_us) if cmd else None
         self.evaluate_trip(now_us, clock_us)
         pump, duty = self.compute_outputs()
@@ -315,6 +356,7 @@ class Plant:
     noise: float = 0.10
     vent_blocked: bool = False
     wire_broken: bool = False
+    adc_floor_mv: float = 0.0  # ESP32 11 dB: a 0 V input reads ~75-150 mV (review C1)
 
     def step(self, dt: float, pump: bool, valve_duty: float) -> None:
         q_in = self.inflow if pump else 0.0
@@ -325,10 +367,10 @@ class Plant:
 
     def v_gpio_mv(self, zero_true: float) -> float:
         if self.wire_broken:
-            return 0.0
+            return self.adc_floor_mv
         p = self.p_sensor + zero_true + random.gauss(0.0, self.noise)
         v = max(0.0, p) / C["SENSOR_MBAR_PER_V"] / C["DIVIDER_RATIO"] * 1000.0
-        return min(v, 3100.0)  # ADC ceiling at 11 dB
+        return min(max(v, self.adc_floor_mv), 3100.0)  # ADC floor / ceiling at 11 dB
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +383,7 @@ class Rig:
         # Rig clock: ms since "boot", deliberately unrelated to the PC clock, with drift.
         self.boot_offset_ms = random.uniform(5_000, 50_000)
         self.sup = Supervisor()
-        self.plant = Plant(noise=args.noise)
+        self.plant = Plant(noise=args.noise, adc_floor_mv=args.adc_floor_mv)
         self.zero_true = args.zero_error  # sensor zero error that ZERO removes
         self.ring: deque = deque(maxlen=int(C["RING_SAMPLES"]))
         self.seq = 0
@@ -374,6 +416,8 @@ class Rig:
             self.plant.vent_blocked = False
         if sc == "sensor_loss":
             self.plant.wire_broken = 60.0 <= t < 90.0
+        if sc == "open_circuit":
+            self.plant.wire_broken = True
         if sc == "wifi_outage":
             down = self.args.outage_at <= t < self.args.outage_at + self.args.outage_len
             if down and not self.wifi_down:
@@ -387,7 +431,8 @@ class Rig:
     # --- 10 Hz control loop ---------------------------------------------------
     async def control_loop(self) -> None:
         period = C["CONTROL_PERIOD_MS"] / 1000.0
-        self.sup.begin(self.clock_us())
+        # Simulated NVS: a valid zero of 0.000 mbar, unless --fresh-nvs (first flash).
+        self.sup.begin(self.clock_us(), zero_ok=not self.args.fresh_nvs)
         prev_us = self.clock_us()
         next_t = time.perf_counter()
         while True:
@@ -446,6 +491,7 @@ class Rig:
                 "t3_us": self.t3[0], "t3_source": self.t3[1], "led_on": self.led_on,
                 "rb_valve_off": bool(C["READBACK_ENABLED"]) and s.valve_duty <= 0.0,
                 "rb_pump_off": bool(C["READBACK_ENABLED"]) and not s.pump_on,
+                "reset_reason": "POWERON",
             }
             prev_us = now_us
             self.ring.append(sample)
@@ -572,7 +618,8 @@ class Rig:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", choices=["normal", "ramp", "sensor_loss", "wifi_outage"], default="normal")
+    ap.add_argument("--scenario", choices=["normal", "ramp", "sensor_loss", "wifi_outage", "open_circuit"],
+                    default="normal")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--noise", type=float, default=0.10, help="sensor noise, mbar (1 sigma)")
@@ -584,6 +631,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--zero-error", type=float, default=0.15, help="sensor zero error, mbar (ZERO removes it)")
     ap.add_argument("--no-autostart", action="store_true", help="stay in IDLE (type START)")
+    ap.add_argument("--fresh-nvs", action="store_true",
+                    help="no zero in NVS, like a first flash: START refused until ZERO (after 60 s in IDLE)")
+    ap.add_argument("--adc-floor-mv", type=float, default=0.0,
+                    help="ESP32 ADC floor: readings below it read as it (real 11 dB: ~75-150 mV)")
     ap.add_argument("--duration", type=float, default=0.0, help="exit after N s (0 = run forever)")
     args = ap.parse_args()
     if args.seed is not None:

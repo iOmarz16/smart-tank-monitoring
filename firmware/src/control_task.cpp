@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include <esp_timer.h>
-#include <stdio.h>
+#include <string.h>
 
 #include "config.h"
 #include "outputs.h"
@@ -57,9 +57,12 @@ void controlTask(void *) {
   static Supervisor sup(clockUs);
   static T3Tracker t3;
 
+  // Review m6: analogReadMilliVolts() characterizes with the GLOBAL attenuation, not the
+  // per-pin one, so set both to 11 dB (they must never differ).
+  analogSetAttenuation(ADC_11db);
   analogSetPinAttenuation(PIN_PT101, ADC_11db);
   if (READBACK_ENABLED) readback::init();  // ISRs attached on core 1
-  sup.begin(clockUs(), g_boot_zero_offset, g_boot_zero_forced);
+  sup.begin(clockUs(), g_boot_zero_offset, g_boot_zero_forced, g_boot_zero_ok);
 
   // Task watchdog: a stall of this task resets the board (outputs fall to the
   // safe state through the pull-downs). Reconfigures the TWDT already started by the core.
@@ -93,10 +96,10 @@ void controlTask(void *) {
     bool replied = false;
     if (have_cmd && cmd.type == CmdType::LED_MODE) {
       led_mode = (LedMode)cmd.arg;
-      reply.zero_changed = false;
-      snprintf(reply.text, sizeof(reply.text), "OK LED MODE %s",
-               led_mode == LedMode::SAMPLE ? "SAMPLE (toggle at t0 of every sample)"
-                                           : "VENT (ON while the vent is commanded fully open)");
+      memset(&reply, 0, sizeof(reply));
+      reply.id = cmd.id;
+      reply.code = ReplyCode::OK_LED_MODE;
+      reply.count = cmd.arg;
       have_cmd = false;
       replied = true;
     }
@@ -144,6 +147,7 @@ void controlTask(void *) {
     s.led_on = led_state;
     s.rb_valve_off = READBACK_ENABLED ? readback::valveOff() : false;
     s.rb_pump_off = READBACK_ENABLED ? readback::pumpOff() : false;
+    s.reset_reason = g_reset_reason;
     prev_start_us = start_us;
     ring::push(s);
 

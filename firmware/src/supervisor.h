@@ -23,7 +23,8 @@ class Supervisor {
   typedef uint64_t (*ClockUs)();
 
   explicit Supervisor(ClockUs clock);
-  void begin(uint64_t now_us, float zero_offset, bool zero_forced);
+  // zero_ok: a valid, non-forced zero offset exists in NVS (START is refused otherwise).
+  void begin(uint64_t now_us, float zero_offset, bool zero_forced, bool zero_ok);
 
   // read_ok = false if the ADC read failed. cmd may be null. reply may be null;
   // if a command was executed, reply->text is filled and *replied set true.
@@ -42,12 +43,16 @@ class Supervisor {
   void updateWarning();
   void execute(const Command &cmd, uint64_t now_us, Reply *reply);
   void evaluateTrip(uint64_t now_us);
-  Outputs computeOutputs();
+  Outputs computeOutputs(uint64_t now_us);
   void enterTrip(TripReason r);
   bool stale(uint64_t now_us) const;
+  // Every state change goes through here: it restarts the IDLE dwell timer and
+  // clears the ZERO window, so ZERO only ever averages samples taken in IDLE.
+  void setState(State s, uint64_t now_us);
 
   ClockUs clock_;
   State state_ = State::BOOT;
+  uint64_t idle_since_us_ = 0;
   TripReason reason_ = TripReason::NONE;
   bool pump_allowed_in_trip_ = false;  // only when PUMP_OFF_AT_SOFT_LIMIT == false
   bool trip_new_ = false;
@@ -56,8 +61,11 @@ class Supervisor {
 
   float zero_offset_ = 0.0f;
   bool zero_forced_ = false;
+  bool zero_ok_ = false;  // valid non-forced zero, persisted in NVS
 
   // validity
+  bool read_ok_ = false;
+  float v_gpio_mv_ = 0.0f;
   bool valid_ = false;
   bool has_ref_ = false;
   float last_valid_p_ = 0.0f;
@@ -68,7 +76,7 @@ class Supervisor {
   uint64_t plaus_low_since_us_ = 0;
   bool plaus_fail_ = false;
 
-  // ZERO averaging: last uncorrected pressures from valid samples
+  // ZERO averaging: last uncorrected pressures from valid IDLE samples
   float zero_hist_[16] = {0};
   int zero_hist_n_ = 0;
   int zero_hist_i_ = 0;
@@ -94,6 +102,8 @@ class Supervisor {
 
   // TEST mode
   bool test_pump_ = false;
+  uint64_t test_pump_since_us_ = 0;  // last TEST PUMP ON
+  bool test_pump_timeout_ = false;   // pump switched OFF by TEST_PUMP_MAX_S
   float test_duty_ = 0.0f;
 
   uint64_t t0_us_ = 0;

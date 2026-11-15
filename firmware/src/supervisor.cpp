@@ -1,13 +1,13 @@
 #include "supervisor.h"
 
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "config.h"
 
 static_assert(SLOPE_WINDOW <= 8, "window arrays hold 8 samples");
 static_assert(ZERO_AVERAGE_SAMPLES <= 16, "zero history holds 16 samples");
+static_assert(ZERO_FORCE_MAX_ABS_OFFSET >= ZERO_MAX_ABS_OFFSET, "FORCE cap below the normal limit");
 
 const char *stateName(State s) {
   switch (s) {
@@ -44,13 +44,23 @@ static float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi 
 
 Supervisor::Supervisor(ClockUs clock) : clock_(clock) {}
 
-void Supervisor::begin(uint64_t now_us, float zero_offset, bool zero_forced) {
+void Supervisor::begin(uint64_t now_us, float zero_offset, bool zero_forced, bool zero_ok) {
   zero_offset_ = zero_offset;
   zero_forced_ = zero_forced;
+  zero_ok_ = zero_ok && !zero_forced;
   t0_us_ = now_us;
   // No valid sample yet: the 0.5 s staleness timer starts at boot.
   last_valid_us_ = now_us;
-  state_ = State::BOOT;
+  setState(State::BOOT, now_us);
+}
+
+void Supervisor::setState(State s, uint64_t now_us) {
+  if (s != state_ || s == State::BOOT) {
+    idle_since_us_ = now_us;
+    zero_hist_n_ = 0;
+    zero_hist_i_ = 0;
+  }
+  state_ = s;
 }
 
 bool Supervisor::stale(uint64_t now_us) const {
@@ -62,6 +72,15 @@ bool Supervisor::stale(uint64_t now_us) const {
 // ---------------------------------------------------------------------------
 void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
   valid_ = false;
+  read_ok_ = read_ok;
+  v_gpio_mv_ = v_gpio_mv;
+  // ZERO window: consecutive valid IDLE samples only. Any invalid sample restarts it
+  // (reset here; refilled below only if this sample turns out valid and in IDLE).
+  const int zero_n_before = zero_hist_n_;
+  const int zero_i_before = zero_hist_i_;
+  zero_hist_n_ = 0;
+  zero_hist_i_ = 0;
+
   if (!read_ok) {
     p_raw_ = NAN;
     reref_count_ = 0;
@@ -107,9 +126,13 @@ void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
   last_valid_p_ = p;
   last_valid_us_ = now_us;
 
-  zero_hist_[zero_hist_i_] = p_uncorr;
-  zero_hist_i_ = (zero_hist_i_ + 1) % ZERO_AVERAGE_SAMPLES;
-  if (zero_hist_n_ < ZERO_AVERAGE_SAMPLES) zero_hist_n_++;
+  if (state_ == State::IDLE) {
+    zero_hist_n_ = zero_n_before;
+    zero_hist_i_ = zero_i_before;
+    zero_hist_[zero_hist_i_] = p_uncorr;
+    zero_hist_i_ = (zero_hist_i_ + 1) % ZERO_AVERAGE_SAMPLES;
+    if (zero_hist_n_ < ZERO_AVERAGE_SAMPLES) zero_hist_n_++;
+  }
 
   // Light first-order filter (Eq. 11).
   if (!pf_init_) {
@@ -172,138 +195,186 @@ void Supervisor::updateWarning() {
 
 // ---------------------------------------------------------------------------
 // 2. Operator commands (serial only; the dashboard has no authority)
+//    Only codes and numbers are filled here; the serial task formats the text.
 // ---------------------------------------------------------------------------
-void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
-  char *out = reply->text;
-  const size_t n = sizeof(reply->text);
-  reply->zero_changed = false;
-  reply->zero_forced = false;
+void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
+  memset(r, 0, sizeof(*r));
+  r->id = cmd.id;
+  r->state = state_;
+  r->reason = reason_;
   const bool sensor_ok = valid_ && !stale(now_us);
 
   switch (cmd.type) {
     case CmdType::ZERO: {
       if (state_ != State::IDLE) {
-        snprintf(out, n, "ERR ZERO only in IDLE (pump OFF, valve OPEN), state=%s", stateName(state_));
+        r->code = ReplyCode::ERR_ZERO_STATE;
+        return;
+      }
+      // Review M3: only after ZERO_MIN_IDLE_S in IDLE (blow-down finished).
+      const uint64_t idle_us = now_us - idle_since_us_;
+      if (idle_us < (uint64_t)ZERO_MIN_IDLE_S * 1000000ULL) {
+        r->code = ReplyCode::ERR_ZERO_DWELL;
+        r->value = (float)(idle_us / 1000ULL) / 1000.0f;
         return;
       }
       if (!sensor_ok || zero_hist_n_ < ZERO_AVERAGE_SAMPLES) {
-        snprintf(out, n, "ERR ZERO needs %d valid samples", ZERO_AVERAGE_SAMPLES);
+        r->code = ReplyCode::ERR_ZERO_SAMPLES;
         return;
       }
-      float sum = 0;
-      for (int i = 0; i < ZERO_AVERAGE_SAMPLES; i++) sum += zero_hist_[i];
+      float sum = 0, lo = zero_hist_[0], hi = zero_hist_[0];
+      for (int i = 0; i < ZERO_AVERAGE_SAMPLES; i++) {
+        sum += zero_hist_[i];
+        lo = fminf(lo, zero_hist_[i]);
+        hi = fmaxf(hi, zero_hist_[i]);
+      }
+      // Review M3: the window must be steady, FORCE or not.
+      if (hi - lo > ZERO_MAX_SPREAD) {
+        r->code = ReplyCode::ERR_ZERO_SPREAD;
+        r->value = hi - lo;
+        return;
+      }
       const float z = sum / ZERO_AVERAGE_SAMPLES;
+      r->value = z;
+      // Review M3: absolute cap, ZERO FORCE cannot override it.
+      if (!(fabsf(z) <= ZERO_FORCE_MAX_ABS_OFFSET)) {
+        r->code = ReplyCode::ERR_ZERO_CAP;
+        return;
+      }
       const bool beyond = fabsf(z) > ZERO_MAX_ABS_OFFSET;
       if (beyond && cmd.arg != 1) {
-        snprintf(out, n,
-                 "ERR ZERO offset %.3f mbar exceeds +/-%.1f: vessel vented? range jumper? "
-                 "(ZERO FORCE overrides)",
-                 z, ZERO_MAX_ABS_OFFSET);
+        r->code = ReplyCode::ERR_ZERO_OFFSET;
         return;
       }
       zero_offset_ = z;
       zero_forced_ = beyond;
-      reply->zero_forced = beyond;
+      // A forced zero never counts as valid for START (review C1).
+      zero_ok_ = !beyond;
       // New zero: restart the drop reference, filter and slope window (A5).
       has_ref_ = false;
       pf_init_ = false;
       win_n_ = 0;
       warn_confirm_ = 0;
       zero_hist_n_ = 0;
-      reply->zero_changed = true;
-      reply->zero_offset = z;
-      if (beyond) {
-        snprintf(out, n,
-                 "WARN ZERO FORCE offset=%.3f mbar exceeds +/-%.1f; saved to NVS, zero_forced=1 "
-                 "is logged in every sample",
-                 z, ZERO_MAX_ABS_OFFSET);
-      } else {
-        snprintf(out, n, "OK ZERO offset=%.3f mbar (saved to NVS)", z);
-      }
+      zero_hist_i_ = 0;
+      r->zero_changed = true;
+      r->zero_forced = beyond;
+      r->zero_offset = z;
+      r->code = beyond ? ReplyCode::WARN_ZERO_FORCE : ReplyCode::OK_ZERO;
       return;
     }
+    case CmdType::ZERO_UNSAVED:
+      // NVS write failed: the offset is active in RAM but not persisted, so START is
+      // refused until a ZERO is saved (review C1, "valid zero exists in NVS").
+      zero_ok_ = false;
+      r->code = ReplyCode::OK_ZERO_UNSAVED;
+      return;
     case CmdType::START:
       if (state_ != State::IDLE) {
-        snprintf(out, n, "ERR START only from IDLE, state=%s", stateName(state_));
+        r->code = ReplyCode::ERR_START_STATE;
       } else if (!sensor_ok) {
-        snprintf(out, n, "ERR START needs a valid sensor sample");
+        r->code = ReplyCode::ERR_START_SENSOR;
+      } else if (!zero_ok_) {
+        r->code = ReplyCode::ERR_START_NO_ZERO;
+        r->flag = zero_forced_;
       } else {
-        state_ = State::RUN;
+        setState(State::RUN, now_us);
         integ_ = 0.0f;
         plaus_low_since_us_ = 0;
-        snprintf(out, n, "OK RUN (pump ON, PI active)");
+        r->code = ReplyCode::OK_RUN;
       }
       return;
     case CmdType::STOP:
       if (state_ == State::RUN || state_ == State::TEST) {
-        state_ = State::IDLE;
-        snprintf(out, n, "OK IDLE (pump OFF, valve OPEN)");
+        setState(State::IDLE, now_us);
+        r->code = ReplyCode::OK_STOP;
       } else if (state_ == State::TRIPPED) {
-        snprintf(out, n, "ERR trip latched (%s): use RESET", tripReasonName(reason_));
+        r->code = ReplyCode::ERR_STOP_TRIPPED;
       } else {
-        snprintf(out, n, "OK already %s", stateName(state_));
+        r->code = ReplyCode::OK_ALREADY;
       }
       return;
     case CmdType::RESET:
       // Section 4.3.1.2 / Fig. 7 rule 7: P < 20 mbar(g), valid non-stale sample,
       // deliberate local operator action. Never from the dashboard.
       if (state_ != State::TRIPPED) {
-        snprintf(out, n, "ERR not tripped, state=%s", stateName(state_));
+        r->code = ReplyCode::ERR_RESET_STATE;
       } else if (!sensor_ok) {
-        snprintf(out, n, "ERR RESET refused: sensor not valid");
+        r->code = ReplyCode::ERR_RESET_SENSOR;
       } else if (!(p_raw_ < RESET_MAX_PRESSURE)) {
-        snprintf(out, n, "ERR RESET refused: P=%.2f >= %.1f mbar(g)", p_raw_, RESET_MAX_PRESSURE);
+        r->code = ReplyCode::ERR_RESET_PRESSURE;
+        r->value = p_raw_;
       } else {
-        state_ = State::IDLE;
+        setState(State::IDLE, now_us);
         reason_ = TripReason::NONE;
         pump_allowed_in_trip_ = false;
         trip_decision_us_ = trip_output_us_ = 0;
-        snprintf(out, n, "OK RESET -> IDLE");
+        r->code = ReplyCode::OK_RESET;
       }
       return;
-    case CmdType::STATUS:
-      snprintf(out, n,
-               "state=%s trip=%s P_raw=%.3f P_f=%.3f valid=%d u_open=%.1f integ=%.3f pump=%d "
-               "duty=%.1f warning=%d zero=%.3f%s trip_dec_us=%llu trip_out_us=%llu",
-               stateName(state_), tripReasonName(reason_), p_raw_, p_f_, valid_ ? 1 : 0, u_open_,
-               integ_, pump_on_ ? 1 : 0, valve_duty_, warning_ ? 1 : 0, zero_offset_,
-               zero_forced_ ? "(FORCED)" : "",
-               (unsigned long long)trip_decision_us_, (unsigned long long)trip_output_us_);
+    case CmdType::STATUS: {
+      StatusSnapshot &s = r->status;
+      s.state = state_;
+      s.reason = reason_;
+      s.p_raw = p_raw_;
+      s.p_f = p_f_;
+      s.v_gpio_mv = v_gpio_mv_;
+      s.u_open = u_open_;
+      s.integ = integ_;
+      s.duty = valve_duty_;
+      s.zero_offset = zero_offset_;
+      s.valid = valid_;
+      s.pump_on = pump_on_;
+      s.warning = warning_;
+      s.zero_forced = zero_forced_;
+      s.zero_ok = zero_ok_;
+      s.idle_s = state_ == State::IDLE ? (uint32_t)((now_us - idle_since_us_) / 1000000ULL) : 0;
+      s.trip_decision_us = trip_decision_us_;
+      s.trip_output_us = trip_output_us_;
+      r->code = ReplyCode::STATUS;
       return;
+    }
     case CmdType::TEST_ENTER:
       if (state_ != State::IDLE) {
-        snprintf(out, n, "ERR TEST only from IDLE, state=%s", stateName(state_));
+        r->code = ReplyCode::ERR_TEST_STATE;
       } else {
-        state_ = State::TEST;
+        setState(State::TEST, now_us);
         test_pump_ = false;
+        test_pump_timeout_ = false;
         test_duty_ = 0.0f;
-        snprintf(out, n, "OK TEST (trip limits still enforced)");
+        r->code = ReplyCode::OK_TEST;
       }
       return;
     case CmdType::TEST_PUMP:
     case CmdType::TEST_VALVE:
     case CmdType::TEST_DUTY:
       if (state_ != State::TEST) {
-        snprintf(out, n, "ERR not in TEST mode (send TEST first)");
+        r->code = ReplyCode::ERR_NOT_TEST;
         return;
       }
-      if (cmd.type == CmdType::TEST_PUMP) test_pump_ = cmd.arg != 0;
+      if (cmd.type == CmdType::TEST_PUMP) {
+        test_pump_ = cmd.arg != 0;
+        // Every TEST PUMP ON (re)starts the TEST_PUMP_MAX_S window (review M1).
+        if (test_pump_) test_pump_since_us_ = now_us;
+        test_pump_timeout_ = false;
+      }
       if (cmd.type == CmdType::TEST_VALVE) test_duty_ = cmd.arg ? 100.0f : 0.0f;
       if (cmd.type == CmdType::TEST_DUTY) test_duty_ = clampf((float)cmd.arg, 0.0f, 100.0f);
-      snprintf(out, n, "OK TEST pump=%s valve_duty(energized)=%.0f%%", test_pump_ ? "ON" : "OFF", test_duty_);
+      r->code = ReplyCode::OK_TEST_SET;
+      r->flag = test_pump_;
+      r->value = test_duty_;
       return;
     case CmdType::TEST_EXIT:
       if (state_ == State::TEST) {
-        state_ = State::IDLE;
-        snprintf(out, n, "OK IDLE");
+        setState(State::IDLE, now_us);
+        r->code = ReplyCode::OK_TEST_EXIT;
       } else {
-        snprintf(out, n, "ERR not in TEST mode");
+        r->code = ReplyCode::ERR_TEST_EXIT;
       }
       return;
     case CmdType::LED_MODE:
       break;  // handled by the control task before step()
   }
-  snprintf(out, n, "ERR unknown command");
+  r->code = ReplyCode::ERR_UNKNOWN;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +382,7 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
 // ---------------------------------------------------------------------------
 void Supervisor::enterTrip(TripReason r) {
   const bool pump_was_on = pump_on_;
-  state_ = State::TRIPPED;
+  setState(State::TRIPPED, clock_());
   reason_ = r;
   trip_new_ = true;
   trip_decision_us_ = clock_();
@@ -321,12 +392,14 @@ void Supervisor::enterTrip(TripReason r) {
 }
 
 void Supervisor::evaluateTrip(uint64_t now_us) {
-  // Low-pressure blind-spot plausibility (Q5): in RUN with the pump ON, P must
-  // leave the < 1 mbar(g) band within 30 s, or the sensor is presumed lost.
+  // Low-pressure blind-spot plausibility (Q5, review C1/M1). Armed whenever the pump
+  // is commanded ON (pump_on_ = the command written last loop), in ANY state, TEST
+  // included. Uses the raw pin voltage, so the zero offset cannot hide an open
+  // circuit. Every completed read counts, valid or not.
   plaus_fail_ = false;
-  if (state_ == State::RUN && pump_on_) {
-    if (valid_) {
-      if (p_raw_ < PLAUS_MIN_PRESSURE) {
+  if (pump_on_) {
+    if (read_ok_) {
+      if (v_gpio_mv_ < OPEN_CIRCUIT_MV_THRESHOLD) {
         if (plaus_low_since_us_ == 0) plaus_low_since_us_ = now_us;
       } else {
         plaus_low_since_us_ = 0;
@@ -363,7 +436,7 @@ void Supervisor::evaluateTrip(uint64_t now_us) {
 // ---------------------------------------------------------------------------
 // 4. Outputs per state. PI (Integrated Spec 2) only in RUN.
 // ---------------------------------------------------------------------------
-Outputs Supervisor::computeOutputs() {
+Outputs Supervisor::computeOutputs(uint64_t now_us) {
   Outputs o{false, true, 0.0f};
   switch (state_) {
     case State::BOOT:
@@ -376,6 +449,11 @@ Outputs Supervisor::computeOutputs() {
       o.pump_on = pump_allowed_in_trip_;
       break;
     case State::TEST:
+      // Review M1: the pump turns OFF by itself after TEST_PUMP_MAX_S.
+      if (test_pump_ && (now_us - test_pump_since_us_) > (uint64_t)TEST_PUMP_MAX_S * 1000000ULL) {
+        test_pump_ = false;
+        test_pump_timeout_ = true;
+      }
       o.pump_on = test_pump_;
       o.valve_safe = test_duty_ <= 0.0f;
       o.valve_duty = test_duty_;
@@ -410,7 +488,7 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
 
   validate(now_us, v_gpio_mv, read_ok);
 
-  if (state_ == State::BOOT && valid_) state_ = State::IDLE;
+  if (state_ == State::BOOT && valid_) setState(State::IDLE, now_us);
 
   if (cmd && reply) {
     execute(*cmd, now_us, reply);
@@ -418,7 +496,7 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   }
 
   evaluateTrip(now_us);
-  const Outputs o = computeOutputs();
+  const Outputs o = computeOutputs(now_us);
 
   Sample &s = sample_;
   s.v_gpio_mv = v_gpio_mv;
@@ -440,5 +518,6 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   s.pump_on = pump_on_;
   s.warning = warning_;
   s.trip = state_ == State::TRIPPED;
+  s.test_pump_timeout = test_pump_timeout_;
   return o;
 }

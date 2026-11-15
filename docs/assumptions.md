@@ -16,6 +16,7 @@ Status key: **OPEN** = waiting for the user · **ASSUMED** = decided, reversible
 | C7 | Warning confirmation | §4.2.2 (Block 9 text, p. 50) vs §4.3.1.2 | Block 9 text: warn "only after **several consecutive** valid, sufficiently steep, positive-slope estimates". §4.3.1.2 rule has no confirmation count and no slope threshold value. 0.05 mbar/s, 3 consecutive samples for the slope rule; 14 mbar(g) rule immediate (Q2). CONFIRMED |
 | C8 | PID vs PI | §4.3.1.2 Eq. 12 (Kp, Ki, Kd unassigned) vs §5.1 / Table 5 | As built: PI from HYSYS, Kc = 36, Ti = 8 s, Kd = 0. | PI, `u = Kc(e + Ts/Ti·Σe)`. |
 | C9 | Power-loss behaviour of vent | §4.3.1.2 (servo not driven open on power loss) vs Table C/D | As built: NO valve vents on power loss. | Ch. 5 wins. |
+| C10 | Passive relief | §4.2.1 Block 5, §4.3.1 (PSV-101 water seal at 30 mbar(g); factory safety valve kept) vs Table C, §5.1.1 | Table C: "No water seal". §5.1.1: the factory safety valve was removed from Port A. | **No passive relief exists on the prototype.** Nothing in the firmware, docs or reviews may count PSV-101 or a safety valve as a layer. Above the software trips, the only hard limits are the pump deadhead (440 mbar, Table D layer 7: the vessel stays safe) and the PT-101 overload (100 mbar: the sensor is at risk). CONFIRMED (user, 2026-11-15) |
 
 ## B. Assumptions
 
@@ -26,37 +27,55 @@ Status key: **OPEN** = waiting for the user · **ASSUMED** = decided, reversible
 | A3 | On trip, the valve LEDC channel is detached and GPIO26 is driven LOW directly, because an LEDC duty change only takes effect at the next PWM period (up to 100 ms later). | §5.2.2 Spec 6 / I3 | ASSUMED (implementation detail) |
 | A4 | During a sensor fault shorter than 0.5 s (invalid sample, not yet stale), the PI integrator is frozen and the last valve duty is held. | Fig. 7 SENSOR FAULT "hold last safe command" | CONFIRMED (Q3) |
 | A5 | First valid sample after boot (or after `ZERO`) has no "last valid" reference, so the drop check is skipped for it. | §5.2.2 | ASSUMED |
-| A6 | Zero offset is in mbar, stored in NVS, default 0.0 if never set. `ZERO` is accepted only in IDLE with pump OFF and valve OPEN (vessel vented). | §5.1.1 step 8 | ASSUMED |
+| A6 | Zero offset is in mbar, stored in NVS, default 0.0 if never set. `ZERO` is accepted only in IDLE with pump OFF and valve OPEN (vessel vented), after ≥ `ZERO_MIN_IDLE_S` = 60 s in IDLE, from the last 10 **consecutive valid IDLE** samples (any state change or invalid sample restarts the window) whose max − min ≤ `ZERO_MAX_SPREAD` = 0.3 mbar. Review M3: a zero taken during blow-down shifts every limit up by the same amount. | §5.1.1 step 8 | CONFIRMED (user, review M3) |
 | A7 | QBM2030-30 range selector must be set to 3000 Pa (BOM lists 1000/1500/3000 Pa). README will tell the operator to check it. | Table B item 7 | ASSUMED |
 | A8 | The 4 relay modules in Table B (item 13) are not used; Fig. 12 uses MOSFETs only. | Table B vs Fig. 12 | ASSUMED |
 | A9 | `t_to_limit` reported as null/absent when slope ≤ `MIN_WARNING_SLOPE`. | §4.3.1.2 ("for a positive accepted slope") | ASSUMED |
 | A10 | The ML early-warning model (§5.2.2, Table H) is out of scope for this step; firmware warning is the rule-based one. The dashboard leaves room to add it later. | §5.2.2 "Limitations and safety" | ASSUMED |
 | A11 | Lag compensation, when enabled, uses the 5-sample regression slope of P_f; it applies to the soft-limit trip only, not the hard trip. | §5.2.2 (I6b fallback, P + 1 s·dP/dt) | ASSUMED |
 | A12 | Valve PWM: 10 Hz, 14-bit LEDC (10-bit cannot reach 10 Hz from the 80 MHz APB clock; 14-bit can). | Table C (PWM ≤ 10 Hz) | ASSUMED |
-| A13 | `ZERO` is refused if the measured offset exceeds ±3.0 mbar (10 % FS, `ZERO_MAX_ABS_OFFSET`): the vessel is probably not vented, or the range jumper is wrong. New constant, not from the report. | §5.1.1 step 8 | CONFIRMED. `ZERO FORCE` overrides it: prints `WARN`, persists `zforced` in NVS, `zero_forced=true` in every sample |
+| A13 | `ZERO` is refused if the measured offset exceeds ±3.0 mbar (10 % FS, `ZERO_MAX_ABS_OFFSET`): the vessel is probably not vented, or the range jumper is wrong. New constant, not from the report. | §5.1.1 step 8 | CONFIRMED. `ZERO FORCE` overrides it up to the absolute cap `ZERO_FORCE_MAX_ABS_OFFSET` = ±5.0 mbar (review M3; FORCE cannot override the cap, the dwell or the spread rule): prints `WARN`, persists `zforced` in NVS, `zero_forced=true` in every sample. A forced zero never allows `START` (A24) |
 | A14 | `TEST DUTY <n>` sets the **energized (closed)** duty of PCV-101, the same quantity as `valve_duty`. `TEST VALVE ENERGIZE` = 100 %, `RELEASE` = 0 %. `TEST` (no argument) enters test mode, only from IDLE. | brief §2.7 | ASSUMED |
 | A15 | Trip check also runs in BOOT and IDLE. No valid sample within 0.5 s of boot → TRIPPED / SENSOR_LOSS. | brief §2.3/§2.6, Fig. 7 | ASSUMED |
 | A16 | With `PUMP_OFF_AT_SOFT_LIMIT = false`, a soft trip keeps the pump in its previous state (ON only if it was ON). Any later hard limit or sensor loss turns it OFF and escalates `trip_reason`. | Table D layers 3–4 | ASSUMED (flag is `true` today) |
 | A17 | Replay: on every WebSocket (re)connect the whole ring buffer (1500 samples = 150 s) is re-sent with `replayed = true`; live samples sent ≥ 3 samples behind the newest are also flagged `replayed`. The dashboard deduplicates by `seq` (first copy wins). The ESP32 cannot know what the client already has, because the only inbound message is ping. Live samples are sent before replayed ones; the backlog is interleaved at `REPLAY_RATE_HZ` = 100 samples/s (user request). | brief §3, I2 | CONFIRMED |
 | A18 | Trip timestamps: `trip_decision_us` = esp_timer when the trip is decided; `trip_output_us` = esp_timer right after `valveSafe()` + pump LOW. These are software timestamps; Table I's t3 uses a spare ESP32 input reading the MOSFET outputs, Optional read-back added (user-approved): GPIO32 = valve `OUT−`, GPIO33 = pump `OUT−` through 36k/10k and 10k/12k dividers, `READBACK_ENABLED = false` by default. Low-side modules assumed (input HIGH = output OFF; to be confirmed with a multimeter, README 3.1). t3 = latest OFF edge of the outputs that were ON at the decision; = decision time if none was ON; `READBACK_TIMEOUT` after 1 s. | §5.2.2 Fig. 16, I3 | CONFIRMED (polarity to verify on hardware) |
-| A19 | Plausibility check uses `P_raw` of valid samples; its 30 s timer starts at the first valid sample below 1.0 mbar(g) in RUN with the pump ON and clears when a valid sample ≥ 1.0 is seen. Invalid samples neither start nor clear it. | user answer Q5 | ASSUMED |
+| A19 | **Superseded by review C1/M1.** Was: `P_raw` < 1.0 mbar(g) for 30 s in RUN. Now: the raw pin voltage `v_gpio_mv` < `OPEN_CIRCUIT_MV_THRESHOLD` for > 30 s while the pump is commanded ON, in **any** state (RUN, TEST, and TRIPPED if the pump were allowed there) → `SENSOR_LOSS`. Raw mV, so the zero offset cannot hide an open circuit. "Commanded ON" = the pump command written in the previous loop. Every completed ADC read counts, valid or not; the timer clears on a read at or above the threshold or when the pump is commanded OFF. `PLAUS_MIN_PRESSURE` was removed. | user answer Q5; review C1, M1 | CONFIRMED (user) |
 | A20 | Task watchdog timeout is 1 s (IDF 4.4 accepts whole seconds only). A stall shorter than 1 s is not caught by the watchdog. Core-0 idle task is also monitored (core default). | brief §2.1, Spec 6 | ASSUMED |
 
 ## C. Sensor-loss blind spot and its mitigation
 
-The drop check (§5.2.2) detects a broken PT-101 wire only when the pressure at that moment is above
-2.0 mbar(g): the reading falls to 0 V = 0 mbar(g), a drop > 2 mbar per sample. Below 2 mbar(g) the
-drop is too small, and 0 mbar(g) is inside the valid range, so the fault is **not detectable** by the
-validity rule. The worst case is RUN start-up (vessel near 0 mbar(g)) with a broken wire: the pump
-runs, the PI sees e = −10 and keeps the vent closed, and pressure rises unseen.
+The drop check (§5.2.2) detects a broken PT-101 wire only when the pressure at that moment is
+clearly above the open-circuit reading: the reading falls to 0 V, a drop > 2 mbar per sample. Near
+0 mbar(g) the drop is too small, and the open-circuit reading is inside the valid range, so the
+fault is **not detectable** by the validity rule. The worst case is RUN start-up (vessel near
+0 mbar(g)) with a broken wire: the pump runs, the PI sees e ≈ −10 and keeps the vent closed, and
+pressure rises unseen.
 
-Mitigation (user decision, Q5): in RUN with the pump ON, if `P_raw` stays below
-`PLAUS_MIN_PRESSURE = 1.0` mbar(g) for more than `PLAUS_TIMEOUT_MS = 30 s`, trip with
-`SENSOR_LOSS`. At the slowest Spec 1 ramp (10 mbar/min) a healthy rig passes 1 mbar(g) in about 6 s.
-Residual risk: in those 30 s the fastest ramp (30 mbar/min) adds up to 15 mbar(g) unseen, which is
-below the 20 mbar(g) limit and far below the 440 mbar pump deadhead (Table D layer 7). A fault in
-RUN at steady 10 mbar(g) is caught by the drop check. Also note that the plausibility check trips
-if the operator runs with FI-101 closed (no inflow) — expected behaviour.
+**ADC floor (review C1).** At 11 dB the ESP32 ADC cannot read below its floor: a 0 V input reads
+about 75–150 mV (Espressif rate 11 dB from ~150 mV), i.e. **+1.0 to +1.9 mbar(g) before the zero
+offset**. The first mitigation (P_raw < 1.0 mbar(g), old A19) therefore never fired while the zero
+offset was 0.0 (first flash, nothing in NVS): the open circuit looks like a vented vessel at
+~1.5 mbar(g). The floor also widens the drop-check blind spot from ~2 to ~3–4 mbar(g) true.
+
+Mitigation (user decisions, Q5 and review C1/M1):
+1. **Open-circuit check on the raw voltage** (A19): pump commanded ON (any state) and
+   `v_gpio_mv` < `OPEN_CIRCUIT_MV_THRESHOLD` for > `PLAUS_TIMEOUT_MS` = 30 s → `SENSOR_LOSS`.
+   The threshold (provisional 250 mV) is set from the bench open-circuit measurement
+   (README 3.3). Constraint on it: at the slowest Spec 1 ramp (10 mbar/min) a healthy rig from
+   0 mbar(g) must cross it well inside 30 s: 5 mbar(g) at 30 s = 388 mV, so keep it ≤ ~350 mV.
+   At 250 mV (3.2 mbar(g)) the slowest ramp crosses after ~19 s.
+2. **START needs a valid, non-forced ZERO in NVS** (A24).
+
+Residual risk: in those 30 s with an undetected open circuit the pump adds, unseen, up to 15 mbar(g)
+at the fastest Spec 1 ramp (30 mbar/min), and up to ~24 mbar(g) at the pump's full 250 mL/min
+(≈ 48 mbar/min with C = 5.2 std cm³/mbar), i.e. possibly **above the 20 mbar(g) limit**, which
+the blind reading cannot see; the 30 s open-circuit trip then vents. **There is no passive relief (C10)**: the remaining hard limits are the pump deadhead
+(440 mbar; the vessel stays safe) and the PT-101 overload (100 mbar; the sensor is at risk, not
+reached in 30 s). A fault in RUN at steady 10 mbar(g) is caught by the drop check. The check also
+trips, as expected, when the pump runs into a vessel that cannot pressurize: FI-101 closed, lid
+open, HV-101 open, or TEST with the vent released and low inflow (open vent at 98.7 std cm³/min
+settles near 4 mbar(g) ≈ 310 mV, close to the provisional threshold).
 
 ## D. Resolved questions (answers 2026-11-15)
 
@@ -80,6 +99,19 @@ if the operator runs with FI-101 closed (no inflow) — expected behaviour.
 
 - C1 — pump-off at 20 vs 29: `PUMP_OFF_AT_SOFT_LIMIT = true` kept until CHE confirms.
 - MOSFET module polarity (low-side) to be measured before the read-back is wired (A18).
+- **A25** `OPEN_CIRCUIT_MV_THRESHOLD = 250` mV is provisional: set it from the bench open-circuit
+  measurement (README 3.3) before any pressurized run.
+- **A26 vs P2** — Table G P2 runs the vent-closed ramp "as T1" at 10 / 20 / 30 mbar/min. With the
+  vent closed the PI cannot be used, so P2 runs in TEST, where the pump now stops after
+  `TEST_PUMP_MAX_S` = 60 s. At 10 mbar/min, 60 s covers only 10 mbar. Re-sending `TEST PUMP ON`
+  within the 60 s restarts the window without interrupting the pump (A26), so P2 is still possible,
+  but the operator must re-confirm every minute. Team to confirm that this is acceptable, or
+  approve a different limit.
+- **P1 vs the 20 mbar(g) trip** (found during review, no code change) — Table G P1 holds 25 mbar(g),
+  vent closed, pump off, for 10 min. The soft trip at 20 mbar(g) is enforced in every state, TEST
+  included, and latches with the vent open, so P1 cannot reach 25 mbar(g) with this firmware.
+  Needs a team decision (e.g. run P1 at a pressure below 20 mbar(g), or a separate, approved
+  procedure). Not changed.
 
 ## F. Additions (answers of 2026-11-15, second round)
 
@@ -88,3 +120,25 @@ if the operator runs with FI-101 closed (no inflow) — expected behaviour.
 | A21 | GPIO2 onboard LED, serial `LED MODE SAMPLE` (toggle at t0 = loop start, before the ADC read) or `LED MODE VENT` (ON while the vent is commanded **fully** open, i.e. de-energized; OFF during PWM). Default VENT, not persisted. Driven LOW first in `setup()`; GPIO2 strapping requires LOW at reset, ensured by the DevKit LED + resistor to GND. | CONFIRMED (user); VENT definition ASSUMED |
 | A22 | Dashboard "LED sync" square mirrors `led_on` of each new live sample on arrival (not on the 100 ms render tick), so one 240 fps video gives t4 − t0 for I1. | ASSUMED |
 | A23 | 36k/10k valve divider gives ≥ 2.475 V (ESP32 V_IH) only for a valve rail ≥ 11.4 V; the full 10.2–13.2 V valve range cannot satisfy both ≤ 3.0 V and ≥ V_IH with one ratio. Valid because Buck 2 is set to 12.0 V (Fig. 12 note 2). | ASSUMED |
+
+## G. Pre-flash safety review (2026-11-15): changes
+
+Review findings C1, M1–M3 and m1–m9. PSV-101 is not on the prototype (C10); the review text that
+counted it as a layer was wrong and is corrected here.
+
+| # | Decision / assumption | Status |
+|---|---|---|
+| A24 | `START` is refused unless a **valid, non-forced zero exists in NVS**. Valid at boot = key `zero` present, `zforced` false, finite, \|zero\| ≤ 3.0 mbar (`ZERO_MAX_ABS_OFFSET`). In a session, a normal `ZERO` sets it, `ZERO FORCE` clears it. The serial task writes the zero to NVS and reads it back; if that fails it tells the control task (`ZERO_UNSAVED`), which clears it again, so an offset that is active in RAM but not saved does not allow `START`. | CONFIRMED (user, review C1) |
+| A25 | `OPEN_CIRCUIT_MV_THRESHOLD` = 250 mV, **provisional**, to be set to the bench open-circuit maximum + margin, ≤ ~350 mV (section C). | OPEN (bench measurement) |
+| A26 | TEST pump limit `TEST_PUMP_MAX_S` = 60 s: after 60 s ON the control task switches the pump OFF and the serial console prints `EVENT TEST pump OFF`. **Every `TEST PUMP ON` restarts the 60 s window**, also while the pump is already ON: a deliberate operator confirmation, which keeps the slow P2 ramp possible (see E). The open-circuit check runs independently of this window. | Limit CONFIRMED (user); restart rule ASSUMED |
+| A27 | Watchdog freeze path (review M2). (a) `esp_task_wdt_isr_user_handler()` (weak hook in IDF 4.4.7 `libesp_system.a`; disassembly shows it is called after the task-name prints and before `abort()`) routes GPIO26 back from LEDC to the GPIO register and clears GPIO26/27. ROM function + register writes only, IRAM. It fires for every watched task (control task; core-0 idle task). (b) `partitions_nocoredump.csv` = Arduino `default.csv` without the 64 KB coredump partition (sdkconfig has `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`), so a panic does not write flash before rebooting; other offsets unchanged, the NVS survives the re-flash. Not covered by the hook: the **interrupt watchdog** (300 ms, interrupts disabled for too long) and other panics go straight to the panic handler (backtrace over UART, ~tens of ms, then reboot), with outputs held until the reset. | CONFIRMED (user, review M2) |
+| A28 | m2: when the valve LEDC pin is detached, the channel is parked at 0 % duty, so a later re-attach starts OPEN (`ledcAttachPin` re-applies the channel's current duty for up to one 100 ms period). m3: `esp_reset_reason()` is printed at boot (with a warning after a watchdog, panic or brownout reset, because the RAM trip latch is lost) and sent in every sample as `reset_reason`. m5: `monitor_dtr = 0` / `monitor_rts = 0`, so opening the PlatformIO monitor does not reset the board (to verify on the real DevKit; other serial programs may still toggle DTR/RTS). m6: `analogSetAttenuation(ADC_11db)` sets the global attenuation that `analogReadMilliVolts` characterizes with, as well as the per-pin one. m9: commands carry an id; a reply that arrives after the 1 s timeout is printed as `LATE` and still processed (a late `ZERO` is still saved); all reply text, including `STATUS`, is formatted by the serial task, so the control task no longer formats floats; `STATUS` adds V_gpio, zero_ok, idle time and the stack high-water marks (control, net, serial). | CONFIRMED (user) |
+
+### Review findings documented without a code change
+
+| # | Finding | Consequence / handling |
+|---|---|---|
+| m1 | Sensor-loss timing: `age > 500 ms` with a 100 ms loop and µs jitter, so the trip falls on the 5th or the 6th missed sample (0.5 or 0.6 s). | Both satisfy Spec 6 ("> 0.5 s"). Expect both values in I3b results; analyze against "pump OFF and vent open ≤ 1.0 s after the 0.5 s timeout". |
+| m4 | NVS flash writes (`ZERO`, serial task, core 0) disable the flash cache on **both** cores, so the control loop stalls briefly (a sector erase can take tens to a few hundred ms). Only possible in IDLE (pump OFF, vent OPEN). Wi-Fi PHY calibration may also write NVS at boot, while the loop is in BOOT; a stall over 0.5 s then gives a SENSOR_LOSS trip at boot (safe direction, `RESET`). | Do not send `ZERO` during an I2 run; a loop period > 110 ms right after a `ZERO` is this effect, not a fault. |
+| m7 | `read_ok` is always true (`analogReadMilliVolts` has no error return), so the NaN path is unused. A saturated ADC reads ~40 mbar(g) → HARD_LIMIT (safe direction). | Kept as a hook for a future sensor driver. |
+| m8 | The soft trip acts on a single raw sample: one ADC spike ≥ 20 mbar(g) latches a trip. | Safe direction (nuisance trip, by design: the filter must not mask a rise). If nuisance trips appear on the rig, look at `v_gpio_mv` in the CSV before changing anything. |

@@ -42,12 +42,14 @@ struct Sample {
   bool zero_forced;   // active zero offset was set with ZERO FORCE (outside +/-3 mbar)
   bool rb_valve_off;  // read-back: valve MOSFET OFF (only if READBACK_ENABLED)
   bool rb_pump_off;   // read-back: pump MOSFET OFF (only if READBACK_ENABLED)
+  uint8_t reset_reason;    // esp_reset_reason() at boot (same value in every sample)
+  bool test_pump_timeout;  // internal (not in the JSON): TEST pump switched OFF by TEST_PUMP_MAX_S
 };
 
 // Commands from the serial task to the control task. Only the control task
 // changes state or outputs.
 enum class CmdType : uint8_t {
-  ZERO,         // arg 1 = FORCE (override the +/-3 mbar limit)
+  ZERO,         // arg 1 = FORCE (override the +/-3 mbar limit, not the +/-5 cap)
   START,
   STOP,
   RESET,
@@ -58,17 +60,69 @@ enum class CmdType : uint8_t {
   TEST_DUTY,    // arg 0..100 = energized (closed) duty %
   TEST_EXIT,
   LED_MODE,     // arg = LedMode; handled by the control task glue, not the supervisor
+  ZERO_UNSAVED, // internal: the serial task could not persist the new zero to NVS
 };
 
 struct Command {
   CmdType type;
   int arg;
+  uint32_t id;  // echoed in the Reply, so a late reply is never taken for the next one
 };
 
-// Reply text from the control task back to the serial task.
+// The control task only fills codes and numbers; the serial task (core 0) does all
+// text formatting, so no float printf runs in the control task (review m9).
+enum class ReplyCode : uint8_t {
+  ERR_UNKNOWN,
+  OK_LED_MODE,         // count = LedMode
+  ERR_ZERO_STATE,      // state
+  ERR_ZERO_DWELL,      // value = s in IDLE so far
+  ERR_ZERO_SAMPLES,
+  ERR_ZERO_SPREAD,     // value = max - min
+  ERR_ZERO_CAP,        // value = offset
+  ERR_ZERO_OFFSET,     // value = offset
+  WARN_ZERO_FORCE,     // value = offset
+  OK_ZERO,             // value = offset
+  OK_ZERO_UNSAVED,
+  ERR_START_STATE,     // state
+  ERR_START_SENSOR,
+  ERR_START_NO_ZERO,   // flag = active zero was forced
+  OK_RUN,
+  OK_STOP,
+  ERR_STOP_TRIPPED,    // reason
+  OK_ALREADY,          // state
+  ERR_RESET_STATE,     // state
+  ERR_RESET_SENSOR,
+  ERR_RESET_PRESSURE,  // value = P_raw
+  OK_RESET,
+  STATUS,              // status
+  ERR_TEST_STATE,      // state
+  OK_TEST,
+  ERR_NOT_TEST,
+  OK_TEST_SET,         // flag = pump, value = duty
+  OK_TEST_EXIT,
+  ERR_TEST_EXIT,
+};
+
+struct StatusSnapshot {
+  State state;
+  TripReason reason;
+  float p_raw, p_f, v_gpio_mv, u_open, integ, duty, zero_offset;
+  bool valid, pump_on, warning, zero_forced, zero_ok;
+  uint32_t idle_s;  // s in IDLE (0 outside IDLE)
+  uint64_t trip_decision_us, trip_output_us;
+};
+
+// Reply from the control task back to the serial task.
 struct Reply {
-  char text[200];
-  bool zero_changed;   // serial task persists zero_offset to NVS
+  uint32_t id;  // = Command.id
+  ReplyCode code;
+  State state;        // state before the command
+  TripReason reason;
+  float value;
+  int count;
+  bool flag;
+  bool zero_changed;  // serial task persists zero_offset to NVS
   bool zero_forced;
   float zero_offset;
+  StatusSnapshot status;  // only for ReplyCode::STATUS
 };

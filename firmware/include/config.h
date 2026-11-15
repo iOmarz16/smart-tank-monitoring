@@ -71,10 +71,16 @@ constexpr uint32_t SENSOR_TIMEOUT_MS = 500;    // no valid sample for > 0.5 s ->
 // New-reference rule after a drop rejection (Q5). Only allowed while TRIPPED.
 constexpr int REREF_SAMPLES = 10;          // consecutive in-range samples (1 s)
 constexpr float REREF_MAX_SPREAD = 0.5f;   // max - min of those samples [mbar]
-// Low-pressure blind-spot plausibility check (Q5): a broken wire below 2 mbar(g)
-// passes the drop check. In RUN with the pump ON the pressure must rise.
-constexpr float PLAUS_MIN_PRESSURE = 1.0f;   // mbar(g)
-constexpr uint32_t PLAUS_TIMEOUT_MS = 30000; // 30 s
+// Low-pressure blind-spot plausibility check (Q5, review C1/M1): a broken wire below
+// ~2 mbar(g) passes the drop check. Whenever the pump is commanded ON (any state,
+// TEST included), the RAW pin voltage must leave the open-circuit band within 30 s,
+// otherwise SENSOR_LOSS. Raw mV, so it does not depend on the zero offset: a 0 V
+// input reads ~75-150 mV at 11 dB (ADC floor), i.e. ~1-2 mbar(g) before the offset.
+// PROVISIONAL: TO BE SET FROM THE BENCH OPEN-CIRCUIT MEASUREMENT (README 3.3):
+// measured max + margin, and at most ~350 mV (the slowest 10 mbar/min ramp from
+// 0 mbar(g) must cross it well inside 30 s: 5 mbar(g) = 388 mV).
+constexpr float OPEN_CIRCUIT_MV_THRESHOLD = 250.0f;  // mV at GPIO34
+constexpr uint32_t PLAUS_TIMEOUT_MS = 30000;         // 30 s
 
 // Light filter so P_f cannot mask a rapid rise (Section 4.3.1.2 Eq. 11, alpha >= 0.5).
 constexpr float PF_ALPHA = 0.5f;
@@ -149,8 +155,17 @@ constexpr uint32_t REPLAY_RATE_HZ = 100;  // replayed samples per second, per cl
 // ---------------------------------------------------------------------------
 constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t TEST_PRINT_PERIOD_MS = 200;  // 5 Hz in TEST mode
-constexpr int ZERO_AVERAGE_SAMPLES = 10;        // ZERO averages the last 1 s
+// TEST mode: the pump turns OFF automatically after this long ON (review M1).
+// Sending TEST PUMP ON again restarts the window (deliberate operator confirmation).
+constexpr uint32_t TEST_PUMP_MAX_S = 60;
+constexpr int ZERO_AVERAGE_SAMPLES = 10;        // ZERO averages the last 1 s of IDLE samples
 // ZERO is refused if the measured offset is larger than this (10 % of full scale):
 // the vessel is probably not vented, or the range jumper is wrong. (A13, user-approved)
 // "ZERO FORCE" overrides it with a warning; zero_forced is then logged in every sample.
 constexpr float ZERO_MAX_ABS_OFFSET = 3.0f;     // mbar
+// Absolute cap, even for ZERO FORCE (review M3): the offset shifts every limit 1:1.
+constexpr float ZERO_FORCE_MAX_ABS_OFFSET = 5.0f;  // mbar
+// ZERO only after this long in IDLE (vessel vented, blow-down finished) (review M3).
+constexpr uint32_t ZERO_MIN_IDLE_S = 60;
+// Max - min of the ZERO_AVERAGE_SAMPLES window (uncorrected mbar) (review M3).
+constexpr float ZERO_MAX_SPREAD = 0.3f;         // mbar
