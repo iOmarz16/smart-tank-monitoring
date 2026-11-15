@@ -164,9 +164,9 @@ void controlTask(void *) {
     s.rb_valve_off = READBACK_ENABLED ? readback::valveOff() : false;
     s.rb_pump_off = READBACK_ENABLED ? readback::pumpOff() : false;
     s.reset_reason = g_reset_reason;
-    // Leak model (A34), display/log only: computed from the logged P_f AFTER the
+    // Leak model (A34), display/log only: computed from the REAL P_f (also in SIM, A35) AFTER the
     // supervisor has decided this step, so it cannot influence trips, warning or PI.
-    const leak::Result lr = leak_model.update(s.p_f, model_pump_on, model_closed_duty);
+    const leak::Result lr = leak_model.update(s.p_f_real, model_pump_on, model_closed_duty);
     s.p_corr = lr.p_corr;
     s.p_comp_assumed = lr.p_comp;
     s.leak_rate = lr.leak_rate;

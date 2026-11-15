@@ -10,6 +10,10 @@ static_assert(ZERO_AVERAGE_SAMPLES <= 16, "zero history holds 16 samples");
 static_assert(ZERO_FORCE_MAX_ABS_OFFSET >= ZERO_MAX_ABS_OFFSET, "FORCE cap below the normal limit");
 static_assert(SOFT_AUTOCLEAR_MAX >= 1 && SOFT_AUTOCLEAR_MAX <= 8, "auto-clear history holds 8 entries");
 static_assert(SOFT_AUTOCLEAR_P < P_SOFT_LIMIT, "auto-clear needs hysteresis below the soft limit");
+// A35: the slowest SIM RAMP (10 mbar/min) from the lowest valid start (P_VALID_MIN) reaches
+// the soft limit, and trips, well before the TEST_PUMP_MAX_S backstop.
+static_assert((P_SOFT_LIMIT - P_VALID_MIN) / 10.0f * 60.0f < (float)TEST_PUMP_MAX_S,
+              "SIM RAMP must trip before the pump time cap");
 
 const char *stateName(State s) {
   switch (s) {
@@ -18,6 +22,7 @@ const char *stateName(State s) {
     case State::RUN: return "RUN";
     case State::TEST: return "TEST";
     case State::TRIPPED: return "TRIPPED";
+    case State::SIM: return "SIM";
   }
   return "?";
 }
@@ -85,14 +90,14 @@ void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
   zero_hist_i_ = 0;
 
   if (!read_ok) {
-    p_raw_ = NAN;
+    p_real_ = NAN;
     reref_count_ = 0;
     return;
   }
   // As built (A29): P = mV x 5 x 3 / 1000 = mV x 0.015, minus the zero offset.
   const float p_uncorr = (v_gpio_mv / 1000.0f) * SENSOR_DIVIDER_RATIO * SENSOR_MBAR_PER_V;
   const float p = p_uncorr - zero_offset_;
-  p_raw_ = p;
+  p_real_ = p;
 
   if (p < P_VALID_MIN) {
     // Range check. Readings above P_RANGE_MAX are deliberately NOT rejected:
@@ -139,6 +144,46 @@ void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
     if (zero_hist_n_ < ZERO_AVERAGE_SAMPLES) zero_hist_n_++;
   }
 
+  // Real filtered pressure (same EMA as P_f), kept in every state for the SIM start
+  // value; also exported in the Sample (p_f_real). Outside SIM it is identical to P_f.
+  if (!pf_real_init_) {
+    p_f_real_ = p;
+    pf_real_init_ = true;
+  } else {
+    p_f_real_ = PF_ALPHA * p + (1.0f - PF_ALPHA) * p_f_real_;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Control pressure (A35). Outside SIM: the real pressure, on valid samples only,
+//     exactly as before. In SIM: the simulated ramp, every step. Called once per step,
+//     after validate(). The real checks above never see the simulated value.
+// ---------------------------------------------------------------------------
+void Supervisor::updateControlPressure(uint64_t now_us) {
+  const bool sim = state_ == State::SIM;
+  if (sim_active_ && !sim) {
+    // Left SIM (SIM EXIT, STOP, trip, time cap): back to the real pressure. P_f continues
+    // from the real filtered value; the slope window restarts so sim and real never mix.
+    p_f_ = p_f_real_;
+    pf_init_ = pf_real_init_;
+    win_n_ = 0;
+    warn_confirm_ = 0;
+    slope_ok_ = false;
+    t_to_limit_ok_ = false;
+    warning_ = pf_init_ && p_f_ >= P_WARNING;
+  }
+  sim_active_ = sim;
+  if (sim) {
+    const float t_s = (float)((now_us - sim_t0_us_) / 1000ULL) / 1000.0f;
+    p_raw_ = sim_p0_ + ((float)sim_rate_ / 60.0f) * t_s;
+    pushControl(now_us, p_raw_);
+    return;
+  }
+  p_raw_ = p_real_;
+  if (valid_) pushControl(now_us, p_real_);
+}
+
+void Supervisor::pushControl(uint64_t now_us, float p) {
   // Light first-order filter (Eq. 11).
   if (!pf_init_) {
     p_f_ = p;
@@ -257,6 +302,7 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       // New zero: restart the drop reference, filter and slope window (A5).
       has_ref_ = false;
       pf_init_ = false;
+      pf_real_init_ = false;
       win_n_ = 0;
       warn_confirm_ = 0;
       zero_hist_n_ = 0;
@@ -290,7 +336,8 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       }
       return;
     case CmdType::STOP:
-      if (state_ == State::RUN || state_ == State::TEST) {
+      // STOP also ends SIM (A35): pump OFF, valve released.
+      if (state_ == State::RUN || state_ == State::TEST || state_ == State::SIM) {
         setState(State::IDLE, now_us);
         r->code = ReplyCode::OK_STOP;
       } else if (state_ == State::TRIPPED) {
@@ -306,9 +353,10 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
         r->code = ReplyCode::ERR_RESET_STATE;
       } else if (!sensor_ok) {
         r->code = ReplyCode::ERR_RESET_SENSOR;
-      } else if (!(p_raw_ < RESET_MAX_PRESSURE)) {
+      } else if (!(p_real_ < RESET_MAX_PRESSURE)) {
+        // Always the REAL pressure (A35), never a simulated one.
         r->code = ReplyCode::ERR_RESET_PRESSURE;
-        r->value = p_raw_;
+        r->value = p_real_;
       } else {
         setState(State::IDLE, now_us);
         reason_ = TripReason::NONE;
@@ -327,6 +375,8 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       s.reason = reason_;
       s.p_raw = p_raw_;
       s.p_f = p_f_;
+      s.p_real = p_real_;
+      s.sim_rate = state_ == State::SIM ? sim_rate_ : 0;
       s.v_gpio_mv = v_gpio_mv_;
       s.u_open = u_open_;
       s.integ = integ_;
@@ -391,6 +441,44 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
         r->code = ReplyCode::OK_TEST_EXIT;
       } else {
         r->code = ReplyCode::ERR_TEST_EXIT;
+      }
+      return;
+    case CmdType::SIM_RAMP:
+      // A35: simulated pressure ramp for trend testing. Real outputs: pump ON, PCV-101
+      // driven by the PI on the simulated pressure (user decision). The real-sensor trips
+      // and checks stay active in the background. Gate as START (A24, user decision).
+      if (state_ != State::IDLE && state_ != State::TEST) {
+        r->code = ReplyCode::ERR_SIM_STATE;
+      } else if (cmd.arg != 10 && cmd.arg != 20 && cmd.arg != 30) {
+        r->code = ReplyCode::ERR_SIM_RATE;
+        r->count = cmd.arg;
+      } else if (!sensor_ok || !pf_real_init_) {
+        r->code = ReplyCode::ERR_SIM_SENSOR;
+      } else if (!zero_ok_) {
+        r->code = ReplyCode::ERR_SIM_NO_ZERO;
+        r->flag = zero_forced_;
+      } else {
+        setState(State::SIM, now_us);
+        sim_rate_ = (uint8_t)cmd.arg;
+        sim_p0_ = p_f_real_;  // starts at the real filtered pressure (user decision)
+        sim_t0_us_ = now_us;
+        integ_ = 0.0f;
+        pi_restart_ = false;
+        test_pump_ = false;  // from TEST: the TEST pump timer no longer applies
+        test_pump_timeout_ = false;
+        // The open-circuit timer is NOT reset: if the pump already ran in TEST, its
+        // 30 s window keeps counting.
+        r->code = ReplyCode::OK_SIM;
+        r->count = cmd.arg;
+        r->value = sim_p0_;
+      }
+      return;
+    case CmdType::SIM_EXIT:
+      if (state_ == State::SIM) {
+        setState(State::IDLE, now_us);
+        r->code = ReplyCode::OK_SIM_EXIT;
+      } else {
+        r->code = ReplyCode::ERR_SIM_EXIT;
       }
       return;
     case CmdType::LED_MODE:
@@ -470,11 +558,16 @@ void Supervisor::evaluateTrip(uint64_t now_us) {
     plaus_low_since_us_ = 0;
   }
 
-  const bool hard = valid_ && p_raw_ >= P_HARD_LIMIT;
+  // Limits on the control pressure (p_raw_: real, or simulated in SIM) AND, always, on
+  // the REAL pressure (A35). Outside SIM p_raw_ == p_real_, so this is the same rule as
+  // before. A simulated sample is always "valid"; the real terms need a valid reading.
+  const bool sim = sim_active_;
+  const bool ctrl_ok = sim || valid_;
+  const bool hard = (valid_ && p_real_ >= P_HARD_LIMIT) || (sim && p_raw_ >= P_HARD_LIMIT);
   float p_soft = p_raw_;
   if (LAG_COMP_ENABLED && slope_ok_) p_soft = fmaxf(p_raw_, p_raw_ + LAG_COMP_S * slope_);
-  const bool soft = valid_ && p_soft >= P_SOFT_LIMIT;
-  const bool loss = stale(now_us) || plaus_fail_;
+  const bool soft = (ctrl_ok && p_soft >= P_SOFT_LIMIT) || (valid_ && p_real_ >= P_SOFT_LIMIT);
+  const bool loss = stale(now_us) || plaus_fail_;  // real sensor only
 
   TripReason r = TripReason::NONE;
   if (hard) r = TripReason::HARD_LIMIT;
@@ -494,7 +587,7 @@ void Supervisor::evaluateTrip(uint64_t now_us) {
     return;
   }
   if (reason_ == TripReason::SOFT_LIMIT && !trip_latched_ && r == TripReason::NONE && valid_ &&
-      !stale(now_us) && zero_ok_ && p_raw_ <= SOFT_AUTOCLEAR_P) {
+      !stale(now_us) && zero_ok_ && p_real_ <= SOFT_AUTOCLEAR_P) {
     autoClear(now_us);
   }
 }
@@ -526,6 +619,10 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
       o.valve_duty = test_duty_;
       u_open_ = 100.0f - test_duty_;
       break;
+    case State::SIM:
+      // A35 (user decision): as RUN, but the PI acts on the simulated P_f. Below the
+      // setpoint it keeps the vent closed, above it opens the vent; the real 20/29 trips
+      // and the real sensor checks stay active in evaluateTrip().
     case State::RUN:
       o.pump_on = true;
       if (valid_) {
@@ -559,12 +656,19 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   if (replied) *replied = false;
 
   validate(now_us, v_gpio_mv, read_ok);
+  updateControlPressure(now_us);
 
   if (state_ == State::BOOT && valid_) setState(State::IDLE, now_us);
 
   if (cmd && reply) {
     execute(*cmd, now_us, reply);
     if (replied) *replied = true;
+  }
+
+  // A35 backstop: SIM never runs the pump longer than the TEST cap. Not reached in normal
+  // use (the ramp trips at 20 mbar(g) first, see the static_assert below).
+  if (state_ == State::SIM && (now_us - sim_t0_us_) > (uint64_t)TEST_PUMP_MAX_S * 1000000ULL) {
+    setState(State::IDLE, now_us);
   }
 
   evaluateTrip(now_us);
@@ -574,6 +678,10 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   s.v_gpio_mv = v_gpio_mv;
   s.p_raw = p_raw_;
   s.p_f = pf_init_ ? p_f_ : NAN;
+  s.p_real = p_real_;
+  s.p_f_real = pf_real_init_ ? p_f_real_ : NAN;
+  s.simulated = sim_active_;
+  s.sim_rate = sim_active_ ? sim_rate_ : 0;
   s.slope = slope_ok_ ? slope_ : NAN;
   s.t_to_limit = t_to_limit_ok_ ? t_to_limit_ : NAN;
   s.u_open = u_open_;

@@ -9,6 +9,8 @@ I2  loop period and logging: mean <= 100 ms, no period > 110 ms, >= 5 samples in
 I5  PI recomputation from the logged P_f (Kc 36, Ti 8 s, Ts 0.1 s): |logged - recomputed|
     duty <= 1 % at every RUN sample, output within 0..100 % without windup
 Extras: I3 trip timing (t3 from read-back when enabled, else software) and I6a warning lead.
+SIM   per SIM RAMP run (A35): fitted slope vs target +/-10 %, warning lead before 20 mbar(g)
+    (>= 10 s), trip decision -> output time. I5 stays RUN-only (Table I is about real runs).
 Standard library only. Gains and limits are read from firmware/include/config.h.
 """
 
@@ -246,6 +248,89 @@ def extras(rows) -> None:
                     print(f"    warning lead at the dashboard: {lead_dash:.1f} s")
 
 
+def sim_runs(rows, quiet: bool = False) -> list[dict]:
+    """SIM RAMP runs (A35): every contiguous stretch of simulated == 1 samples.
+
+    Per run: least-squares slope of the simulated P_raw against t_esp_ms (mbar/min) vs the
+    target rate (+/-10 %); warning lead = first sample of the warning stretch that is
+    still on when the simulated pressure first reaches 20 mbar(g), up to that sample
+    (IS1/I6 need >= 10 s); trip decision -> output write time (software timestamps).
+    The trip sample itself is still simulated (the trip ends SIM on the next sample)."""
+    lim = C["P_SOFT_LIMIT"]
+    runs: list[list[dict]] = []
+    prev_seq = None
+    for r in rows:
+        if not flag(r.get("simulated", "0")):
+            prev_seq = None
+            continue
+        seq = int(r["seq"])
+        if prev_seq is None or seq != prev_seq + 1 or num(r["sim_rate"]) != num(runs[-1][-1]["sim_rate"]):
+            runs.append([])
+        runs[-1].append(r)
+        prev_seq = seq
+    out = []
+    if not quiet:
+        print("\n== SIM RAMP runs (A35: simulated pressure; real protection stays on) ==")
+        if not runs:
+            print("  no SIM samples in this log")
+    for i, run in enumerate(runs, 1):
+        rate = num(run[0]["sim_rate"]) or 0.0
+        pts = [(num(r["t_esp_ms"]) / 1000.0, num(r["P_raw"])) for r in run
+               if num(r["P_raw"]) is not None and num(r["t_esp_ms"]) is not None]
+        fit = math.nan
+        if len(pts) >= 3:
+            n = len(pts)
+            mt = sum(t for t, _ in pts) / n
+            mp = sum(p for _, p in pts) / n
+            sxx = sum((t - mt) ** 2 for t, _ in pts)
+            if sxx > 0:
+                fit = sum((t - mt) * (p - mp) for t, p in pts) / sxx * 60.0  # mbar/min
+        slope_ok = rate > 0 and not math.isnan(fit) and abs(fit - rate) <= 0.10 * rate
+        # warning lead before the simulated pressure reaches the soft limit
+        k20 = next((k for k, r in enumerate(run) if (num(r["P_raw"]) or -1e9) >= lim), None)
+        lead = None
+        if k20 is not None and flag(run[k20]["warning"]):
+            k = k20
+            while k > 0 and flag(run[k - 1]["warning"]):
+                k -= 1
+            lead = (num(run[k20]["t_esp_ms"]) - num(run[k]["t_esp_ms"])) / 1000.0
+        elif k20 is not None:
+            lead = 0.0  # reached 20 without a warning
+        # trip: the first TRIPPED sample of the run (the step that decided it)
+        trip = next((r for r in run if r["state"] == "TRIPPED"), None)
+        dec_out = None
+        if trip is not None:
+            dec, outp = num(trip["trip_decision_us"]), num(trip["trip_output_us"])
+            if dec and outp:
+                dec_out = outp - dec
+        end = "trip" if trip is not None else "ended without a trip (SIM EXIT / STOP / log end)"
+        res = {"run": i, "seq0": int(run[0]["seq"]), "seq1": int(run[-1]["seq"]), "rate": rate,
+               "fit": fit, "slope_ok": slope_ok, "lead_s": lead,
+               "lead_ok": lead is not None and lead >= 10.0, "trip": trip is not None,
+               "trip_reason": trip["trip_reason"] if trip is not None else None,
+               "real_at_trip": num(trip.get("P_real", "")) if trip is not None else None,
+               "dec_out_us": dec_out, "end": end}
+        out.append(res)
+        if quiet:
+            continue
+        dur = (num(run[-1]["t_esp_ms"]) - num(run[0]["t_esp_ms"])) / 1000.0
+        print(f"  run {i}: seq {res['seq0']}..{res['seq1']} ({dur:.1f} s), target {rate:g} mbar/min, "
+              f"{end}")
+        print(f"    fitted slope     : {fit:.2f} mbar/min ({(fit / rate - 1) * 100:+.2f} %)  "
+              f"target +/-10 %: {verdict(slope_ok)}" if rate else "    fitted slope     : no rate")
+        if lead is None:
+            print(f"    warning lead     : n/a (simulated pressure never reached {lim:g} mbar(g))")
+        else:
+            print(f"    warning lead     : {lead:.1f} s before {lim:g} mbar(g)  "
+                  f"(IS1/I6 need >= 10 s): {verdict(res['lead_ok'])}")
+        if trip is not None:
+            print(f"    trip             : {res['trip_reason']}, P_sim {trip['P_raw']}, "
+                  f"P_real {trip.get('P_real', '')}")
+            print("    decision -> output: " + (f"{dec_out:.0f} us (software timestamps)"
+                                                if dec_out is not None else "n/a"))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", type=Path)
@@ -263,6 +348,9 @@ def main() -> int:
     print(f"file: {a.csv}  ({len(rows)} unique samples)")
     res = {"I1": i1(rows), "I2": i2(rows), "I5": i5(rows)}
     extras(rows)
+    sims = sim_runs(rows)
+    if sims:
+        res["SIM"] = all(r["slope_ok"] and (r["lead_s"] is None or r["lead_ok"]) for r in sims)
     print("\nsummary: " + "  ".join(f"{k} {verdict(v)}" for k, v in res.items()))
     print("(I5 FAIL with 'no RUN samples' just means the log has no RUN period.)")
     return 0 if all(res.values()) else 1

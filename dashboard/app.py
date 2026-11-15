@@ -38,12 +38,13 @@ STATIC = HERE / "static"
 LOGS = HERE / "logs"
 
 SAMPLE_FIELDS = [
-    "seq", "t_esp_ms", "P_raw", "P_f", "valid", "u_open", "integ", "valve_duty", "pump_on",
+    # A35: in SIM, P_raw / P_f are the simulated pressure; P_real is always the measured one.
+    "seq", "t_esp_ms", "P_raw", "P_f", "P_real", "simulated", "sim_rate", "valid", "u_open", "integ", "valve_duty", "pump_on",
     "warning", "t_to_limit", "state", "trip", "trip_reason", "loop_period_us", "replayed",
     "slope", "v_gpio_mv", "sensor_fault", "zero_offset", "zero_forced", "trip_decision_us",
     "trip_output_us", "t3_us", "t3_source", "led_on", "rb_valve_off", "rb_pump_off", "reset_reason",
     "trip_latched", "auto_clears",
-    # A34 team leak model: LOG AND DISPLAY ONLY (P_comp_assumed is an assumption, not a measurement)
+    # A34 team leak model: LOG ONLY, not shown on the dashboard (P_comp_assumed is an assumption)
     "P_corr", "P_comp_assumed", "leak_rate",
 ]
 CSV_FIELDS = SAMPLE_FIELDS + ["t_arrival_pc_ms", "t_arrival_wall", "clock_offset_ms", "latency_ms"]
@@ -205,6 +206,7 @@ class Session:
         if replayed:
             self.replayed_count += 1
         row = dict(m)
+        row["simulated"] = 1 if m.get("simulated") else 0  # A35: 0/1 in the CSV
         row.update(t_arrival_pc_ms=round(t_arr, 3),
                    t_arrival_wall=datetime.now().isoformat(timespec="milliseconds"),
                    clock_offset_ms=None if self.offset_ms is None else round(self.offset_ms, 3),

@@ -266,7 +266,11 @@ for name in ("supervisor.cpp", "supervisor.h"):
     check(f"A34 {name} never references the leak model", not hits, ", ".join(hits))
 includers = sorted(p.name for p in (FW / "src").glob("*.*") if re.search(
     r'#\s*include\s*"leak_model\.h"', p.read_text(encoding="utf-8")))
-check("A34 leak_model.h included by control_task.cpp only", includers == ["control_task.cpp"], str(includers))
+check("A34 leak_model.h included only by control_task.cpp and the log-only ring.cpp",
+      includers == ["control_task.cpp", "ring.cpp"], str(includers))
+ring_src = code_only((FW / "src" / "ring.cpp").read_text(encoding="utf-8"))
+check("A34 ring.cpp uses only leak::rate() (rebuild of the logged leak_rate)",
+      set(re.findall(r"leak::(\w+)", ring_src)) == {"rate"}, str(set(re.findall(r"leak::(\w+)", ring_src))))
 ct = code_only((FW / "src" / "control_task.cpp").read_text(encoding="utf-8"))
 i_step, i_leak = ct.find("sup.step("), ct.find("leak_model.update(")
 check("A34 leak model computed after sup.step() in the control task", 0 <= i_step < i_leak,
@@ -323,12 +327,172 @@ check("A34 P_comp rose past the hard limit in the scenario", max_comp > C["P_HAR
 check("A34 P_comp above 29 causes no trip and no warning (measured 5 mbar(g))", not events,
       f"{events} state={r.s.state}/{r.s.reason}")
 
-# 13e. Dashboard: P_comp_assumed is only drawn (chart) and printed (its own readout);
-#      the status colour, warning and trip display never read it.
-js = (fr.ROOT / "dashboard" / "static" / "app.js").read_text(encoding="utf-8")
-uses = [ln.strip() for ln in js.splitlines() if "P_comp" in ln and not ln.strip().startswith("//")]
-check("A34 dashboard status/warning/trip never read P_comp_assumed",
-      len(uses) == 1 and uses[0].startswith('$("pcomp").textContent'), "; ".join(uses))
+# 13e. Dashboard (A35): P_comp_assumed is no longer shown at all; it stays in the CSV only.
+static = fr.ROOT / "dashboard" / "static"
+hits = sorted(p.name for p in static.glob("*.*") if re.search(r"P_comp|pcomp|comp", p.read_text(encoding="utf-8")))
+check("A35 dashboard pages never reference P_comp_assumed", not hits, str(hits))
+app_src = (fr.ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+check("A35 P_comp_assumed stays in the CSV columns", '"P_comp_assumed"' in app_src)
+
+# ---------------------------------------------------------------------------------------
+# 15. A35 SIM RAMP: the simulated pressure drives PI, warning and the 20/29 trips; the REAL
+#     sensor protection (20/29 on the real pressure, stale, drop, open circuit) stays on.
+# ---------------------------------------------------------------------------------------
+import analyze_log as al  # noqa: E402
+
+
+def sim_run(rate=20, real=3.0, zero=0.0, zero_ok=True, start="IDLE"):
+    r = Run(zero_ok=zero_ok, zero=zero)
+    r.hold(real * MV_PER_MBAR, 1)
+    if start == "TEST":
+        r.s.set_state("TEST", r.t)
+    return r, r.step(real * MV_PER_MBAR, f"SIM RAMP {rate}")
+
+
+r, rep = sim_run(zero_ok=False)
+check("A35 SIM RAMP refused without a saved zero", r.s.state == "IDLE" and "ZERO" in rep, rep)
+r = Run(zero_ok=True)
+r.run_at(10.0)
+rep = r.step(10.0 * MV_PER_MBAR, "SIM RAMP 20")
+check("A35 SIM RAMP refused from RUN", r.s.state == "RUN" and rep.startswith("ERR"), rep)
+r, rep = sim_run(rate=15)
+check("A35 SIM RAMP rate other than 10/20/30 refused", r.s.state == "IDLE" and "10, 20 or 30" in rep, rep)
+r, rep = sim_run(start="TEST")
+check("A35 SIM RAMP accepted from TEST", r.s.state == "SIM", rep)
+r, rep = sim_run(rate=20, real=3.0)
+check("A35 SIM RAMP accepted from IDLE, starts at the real P_f", r.s.state == "SIM" and abs(r.s.sim_p0 - 3.0) < 1e-6,
+      rep)
+r.step(3.0 * MV_PER_MBAR)
+check("A35 in SIM: pump ON, vent closed by the PI below the setpoint",
+      r.s.pump_on and r.s.valve_duty == 100.0 and r.s.sim_active, f"duty={r.s.valve_duty}")
+p_a, t_a = r.s.p_raw, r.t
+r.hold(3.0 * MV_PER_MBAR, 10)
+rate_meas = (r.s.p_raw - p_a) / ((r.t - t_a) / 1e6) * 60.0
+check("A35 simulated pressure ramps at the commanded rate", abs(rate_meas - 20.0) < 0.01, f"{rate_meas:.4f} mbar/min")
+check("A35 real pressure is kept separately (P_real)", abs(r.s.p_real - 3.0) < 1e-6 and r.s.p_raw > 5.0,
+      f"P_sim={r.s.p_raw:.2f} P_real={r.s.p_real:.2f}")
+r.hold(3.0 * MV_PER_MBAR, 15)  # sim ~ 11.3: above the setpoint
+check("A35 PI opens PCV-101 on the simulated pressure above the setpoint", r.s.u_open > 0.0 and r.s.valve_duty < 100.0,
+      f"P_sim={r.s.p_raw:.2f} u_open={r.s.u_open:.1f}")
+
+# Full ramps: warning before 20, SOFT_LIMIT trip on the simulated pressure, latched.
+# Real input = the rig's measured pump-ON reading (314 mV with the 2.13 mbar zero, A25):
+# a 0 V real reading with the pump ON would (correctly) trip the open-circuit check.
+RIG_MV, RIG_ZERO = 314.0, 2.13
+leads = {}
+for rate in (10, 20, 30):
+    r, _ = sim_run(rate=rate, real=RIG_MV * 0.015 - RIG_ZERO, zero=RIG_ZERO)
+    rows, t_warn, trip_row = [], None, None
+    for _ in range(int(25 / rate * 60 * 10) + 50):
+        r.step(RIG_MV)
+        if r.s.warning and t_warn is None:
+            t_warn = r.t
+        if r.s.state == "TRIPPED":
+            trip_row = (r.s.sim_active, r.s.p_raw, r.s.reason, r.s.trip_latched, r.s.pump_on, r.s.valve_duty)
+            break
+        if not r.s.warning:
+            t_warn = None
+    leads[rate] = None if t_warn is None else (r.t - t_warn) / 1e6
+    check(f"A35 SIM {rate}: SOFT_LIMIT trip at simulated 20 mbar(g), latched, pump OFF, vent open",
+          trip_row is not None and trip_row[0] and trip_row[1] >= 20.0 and trip_row[2] == "SOFT_LIMIT"
+          and trip_row[3] and not trip_row[4] and trip_row[5] == 0.0, str(trip_row))
+    r.step(RIG_MV)
+    check(f"A35 SIM {rate}: after the trip the pressure is the real one again",
+          not r.s.sim_active and r.s.p_raw == r.s.p_real and r.s.state == "TRIPPED")
+    rep = r.step(RIG_MV, "RESET")
+    check(f"A35 SIM {rate}: RESET uses the real pressure (2.6 < 20) -> IDLE", r.s.state == "IDLE", rep)
+print(f"  info: SIM warning leads before the trip: "
+      + ", ".join(f"{k} mbar/min {v:.1f} s" if v is not None else f"{k}: none" for k, v in leads.items()))
+
+# Real background protection while the simulated pressure is low.
+r, _ = sim_run(rate=10, real=3.0)
+r.hold(3.0 * MV_PER_MBAR, 2)
+r.to(20.5, rate=1.5)  # REAL pressure rises to 20.5 (sim still ~3.5)
+check("A35 REAL pressure >= 20 trips SOFT_LIMIT in SIM (latched)",
+      r.s.state == "TRIPPED" and r.s.reason == "SOFT_LIMIT" and r.s.trip_latched and r.s.p_real >= 20.0,
+      f"{r.s.state}/{r.s.reason} P_real={r.s.p_real:.2f}")
+r, _ = sim_run(rate=10, real=3.0)
+r.hold(3.0 * MV_PER_MBAR, 2)
+r.step(29.5 * MV_PER_MBAR)  # one-sample jump of the REAL pressure
+check("A35 REAL pressure >= 29 trips HARD_LIMIT in SIM", r.s.state == "TRIPPED" and r.s.reason == "HARD_LIMIT",
+      f"{r.s.state}/{r.s.reason}")
+r, _ = sim_run(rate=10, real=0.0, zero=2.13)
+r.hold(147.7, 31)  # real open circuit (A25 max) while the simulated pressure ramps
+check("A35 REAL open circuit trips SENSOR_LOSS in SIM after 30 s",
+      r.s.state == "TRIPPED" and r.s.reason == "SENSOR_LOSS", f"{r.s.state}/{r.s.reason} P_sim={r.s.p_raw:.2f}")
+r, _ = sim_run(rate=10, real=8.0)
+r.hold(8.0 * MV_PER_MBAR, 1)
+r.hold(0.0, 1)  # REAL wire break: 8 -> 0 mbar(g) drop is rejected, sensor goes stale
+check("A35 REAL wire break (drop + stale) trips SENSOR_LOSS in SIM", r.s.state == "TRIPPED"
+      and r.s.reason == "SENSOR_LOSS", f"{r.s.state}/{r.s.reason}")
+r, _ = sim_run(rate=10, real=3.0)
+for _ in range(6):
+    r.t += DT
+    r.s.step(r.t, 0.0, False, None, r.t)  # REAL read failures
+check("A35 REAL read failures (stale) trip SENSOR_LOSS in SIM", r.s.state == "TRIPPED"
+      and r.s.reason == "SENSOR_LOSS")
+
+# Static, firmware: the C++ trip evaluation keeps the REAL-pressure terms in every state
+# (this file otherwise tests the Python port).
+sup_src = code_only((FW / "src" / "supervisor.cpp").read_text(encoding="utf-8"))
+ev = sup_src[sup_src.find("void Supervisor::evaluateTrip"):sup_src.find("Outputs Supervisor::computeOutputs")]
+check("A35 firmware soft trip includes the REAL pressure term",
+      "(valid_ && p_real_ >= P_SOFT_LIMIT)" in ev)
+check("A35 firmware hard trip includes the REAL pressure term",
+      "(valid_ && p_real_ >= P_HARD_LIMIT)" in ev)
+check("A35 firmware RESET checks the REAL pressure", "!(p_real_ < RESET_MAX_PRESSURE)" in sup_src)
+check("A35 firmware sensor checks never use the simulated pressure",
+      "sim" not in sup_src[sup_src.find("void Supervisor::validate"):sup_src.find("void Supervisor::updateControlPressure")])
+
+# Ending SIM.
+r, _ = sim_run(rate=20, real=3.0)
+r.hold(3.0 * MV_PER_MBAR, 3)
+rep = r.step(3.0 * MV_PER_MBAR, "SIM EXIT")
+check("A35 SIM EXIT -> IDLE, pump OFF, valve released", r.s.state == "IDLE" and not r.s.pump_on
+      and r.s.valve_duty == 0.0, rep)
+r.step(3.0 * MV_PER_MBAR)
+check("A35 after SIM EXIT the control pressure is the real one", r.s.p_raw == r.s.p_real and not r.s.sim_active)
+r, _ = sim_run(rate=20, real=3.0)
+r.hold(3.0 * MV_PER_MBAR, 3)
+rep = r.step(3.0 * MV_PER_MBAR, "STOP")
+check("A35 STOP also ends SIM", r.s.state == "IDLE" and not r.s.pump_on, rep)
+
+# Outside SIM nothing changed: the control pressure is the real pressure in every sample.
+r = Run(zero_ok=True)
+r.run_at(10.0)
+same = True
+for _ in range(100):
+    r.step(10.0 * MV_PER_MBAR)
+    same = same and r.s.p_raw == r.s.p_real and not r.s.sim_active
+check("A35 outside SIM P_raw == P_real (no change to RUN)", same)
+
+# analyze_log.py SIM report on a synthetic log from the Python port.
+rows = []
+r, _ = sim_run(rate=30, real=RIG_MV * 0.015 - RIG_ZERO, zero=RIG_ZERO)
+seq = 0
+for _ in range(700):
+    r.step(RIG_MV)
+    tripped_now = r.s.trip_new
+    if tripped_now:
+        r.s.trip_output_us = r.s.trip_decision_us + 40
+    rows.append({"seq": str(seq), "t_esp_ms": str(r.t / 1000.0), "P_raw": str(r.s.p_raw),
+                 "P_real": str(r.s.p_real), "simulated": "1" if r.s.sim_active else "0",
+                 "sim_rate": str(r.s.sim_rate if r.s.sim_active else 0), "state": r.s.state,
+                 "warning": str(r.s.warning), "trip_reason": r.s.reason,
+                 "trip_decision_us": str(r.s.trip_decision_us), "trip_output_us": str(r.s.trip_output_us)})
+    seq += 1
+    if r.s.state == "TRIPPED" and not r.s.sim_active:
+        break
+res = al.sim_runs(rows, quiet=True)
+check("A35 analyze_log finds one SIM run with a trip", len(res) == 1 and res[0]["trip"], str(res))
+if res:
+    check("A35 analyze_log fitted slope within +/-10 % of 30 mbar/min", res[0]["slope_ok"], f"{res[0]['fit']:.3f}")
+    check("A35 analyze_log reports the warning lead and decision->output time",
+          res[0]["lead_s"] is not None and res[0]["dec_out_us"] == 40 and res[0]["trip_reason"] == "SOFT_LIMIT",
+          str(res[0]))
+    check("A35 analyze_log warning lead matches the direct measurement (+/-0.1 s)",
+          leads[30] is not None and abs(res[0]["lead_s"] - leads[30]) <= 0.1001,
+          f"{res[0]['lead_s']} vs {leads[30]}")
 
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

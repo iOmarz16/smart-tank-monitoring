@@ -2,11 +2,13 @@
 // ADC reading per 100 ms loop; it returns the output commands and fills a Sample.
 //
 // Order inside step() (Section 4.3.1.2, Algorithm 1):
-//   1. convert + validate the reading, update P_f, slope and warning (display only)
+//   1. convert + validate the REAL reading (range, drop, stale: always on the sensor),
+//      then the control pressure: the real one, or the SIM RAMP pressure in SIM (A35).
+//      P_f, slope and warning (display only) follow the control pressure
 //   2. execute at most one operator command (serial only)
 //   3. evaluate the trip (every state, BEFORE PI); a trip latches, except a SOFT_LIMIT
 //      trip from RUN, which may auto-clear at P <= SOFT_AUTOCLEAR_P (A30)
-//   4. compute outputs for the current state (PI only in RUN)
+//   4. compute outputs for the current state (PI in RUN and in SIM, A35)
 #pragma once
 
 #include <stdint.h>
@@ -41,6 +43,8 @@ class Supervisor {
 
  private:
   void validate(uint64_t now_us, float v_gpio_mv, bool read_ok);
+  void updateControlPressure(uint64_t now_us);
+  void pushControl(uint64_t now_us, float p);
   void updateWarning();
   void execute(const Command &cmd, uint64_t now_us, Reply *reply);
   void evaluateTrip(uint64_t now_us);
@@ -78,7 +82,8 @@ class Supervisor {
   bool has_ref_ = false;
   float last_valid_p_ = 0.0f;
   uint64_t last_valid_us_ = 0;
-  float p_raw_ = 0.0f;
+  float p_real_ = 0.0f;  // REAL sensor pressure, zero applied (NaN if the read failed)
+  float p_raw_ = 0.0f;   // control pressure: = p_real_, or the SIM RAMP pressure in SIM
   int reref_count_ = 0;
   float reref_min_ = 0.0f, reref_max_ = 0.0f;
   uint64_t plaus_low_since_us_ = 0;
@@ -91,6 +96,14 @@ class Supervisor {
   int zero_hist_i_ = 0;
 
   // filter / slope / warning
+  // Real filtered pressure, always from the sensor (same EMA). Outside SIM it equals p_f_.
+  bool pf_real_init_ = false;
+  float p_f_real_ = 0.0f;
+  // SIM RAMP (A35): test mode with a simulated pressure ramp; real protection stays on.
+  bool sim_active_ = false;   // this step's control pressure is simulated
+  uint8_t sim_rate_ = 0;      // mbar/min: 10, 20 or 30
+  float sim_p0_ = 0.0f;       // start value = real P_f at SIM RAMP
+  uint64_t sim_t0_us_ = 0;
   bool pf_init_ = false;
   float p_f_ = 0.0f;
   uint64_t win_t_us_[8] = {0};

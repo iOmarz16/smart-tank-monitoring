@@ -22,6 +22,7 @@ Scenarios:
                  SENSOR_LOSS 30 s later. Try it with --adc-floor-mv 120
 
 Console (stdin) commands, like the USB serial port: ZERO [FORCE] START STOP RESET STATUS,
+SIM RAMP <10|20|30>, SIM EXIT (A35; try --no-autostart then SIM RAMP 30),
 LED MODE SAMPLE|VENT. TEST mode is not simulated (a trip from TEST always latches).
 The simulated NVS holds a valid zero of 0.000 mbar at start (START allowed); use
 --fresh-nvs to start like a first flash (START refused until ZERO).
@@ -108,7 +109,14 @@ class Supervisor:
     has_ref: bool = False
     last_valid_p: float = 0.0
     last_valid_us: int = 0
-    p_raw: float = 0.0
+    p_real: float = 0.0            # REAL sensor pressure (A35)
+    p_raw: float = 0.0             # control pressure: = p_real, or the SIM pressure in SIM
+    pf_real_init: bool = False
+    p_f_real: float = 0.0
+    sim_active: bool = False
+    sim_rate: int = 0
+    sim_p0: float = 0.0
+    sim_t0_us: int = 0
     reref_count: int = 0
     reref_min: float = 0.0
     reref_max: float = 0.0
@@ -151,12 +159,12 @@ class Supervisor:
         kept = list(self.zero_hist)
         self.zero_hist.clear()
         if not read_ok:
-            self.p_raw = NAN
+            self.p_real = NAN
             self.reref_count = 0
             return
         p_uncorr = (v_mv / 1000.0) * C["SENSOR_DIVIDER_RATIO"] * C["SENSOR_MBAR_PER_V"]
         p = p_uncorr - self.zero_offset
-        self.p_raw = p
+        self.p_real = p
         if p < C["P_VALID_MIN"]:
             self.reref_count = 0
             return
@@ -187,6 +195,33 @@ class Supervisor:
         if self.state == "IDLE":
             self.zero_hist.extend(kept)
             self.zero_hist.append(p_uncorr)
+        a = C["PF_ALPHA"]
+        if not self.pf_real_init:
+            self.p_f_real, self.pf_real_init = p, True
+        else:
+            self.p_f_real = a * p + (1 - a) * self.p_f_real
+
+    def update_control_pressure(self, now_us: int) -> None:
+        # A35: control pressure = real (valid samples only, as before) or the SIM ramp.
+        sim = self.state == "SIM"
+        if self.sim_active and not sim:
+            # Left SIM: back to the real pressure; the slope window restarts.
+            self.p_f, self.pf_init = self.p_f_real, self.pf_real_init
+            self.win.clear()
+            self.warn_confirm = 0
+            self.slope_ok = self.t_to_limit_ok = False
+            self.warning = self.pf_init and self.p_f >= C["P_WARNING"]
+        self.sim_active = sim
+        if sim:
+            t_s = ((now_us - self.sim_t0_us) // 1000) / 1000.0
+            self.p_raw = self.sim_p0 + self.sim_rate / 60.0 * t_s
+            self.push_control(now_us, self.p_raw)
+            return
+        self.p_raw = self.p_real
+        if self.valid:
+            self.push_control(now_us, self.p_real)
+
+    def push_control(self, now_us: int, p: float) -> None:
         if not self.pf_init:
             self.p_f, self.pf_init = p, True
         else:
@@ -239,7 +274,7 @@ class Supervisor:
             self.zero_offset = z
             self.zero_forced = beyond
             self.zero_ok = not beyond
-            self.has_ref = self.pf_init = False
+            self.has_ref = self.pf_init = self.pf_real_init = False
             self.win.clear()
             self.warn_confirm = 0
             self.zero_hist.clear()
@@ -259,7 +294,7 @@ class Supervisor:
             self.pi_restart = False
             return "OK RUN"
         if cmd == "STOP":
-            if self.state in ("RUN", "TEST"):
+            if self.state in ("RUN", "TEST", "SIM"):  # STOP also ends SIM (A35)
                 self.set_state("IDLE", now_us)
                 return "OK IDLE"
             if self.state == "TRIPPED":
@@ -270,8 +305,8 @@ class Supervisor:
                 return f"ERR not tripped, state={self.state}"
             if not ok:
                 return "ERR RESET refused: sensor not valid"
-            if not self.p_raw < C["RESET_MAX_PRESSURE"]:
-                return f"ERR RESET refused: P={self.p_raw:.2f}"
+            if not self.p_real < C["RESET_MAX_PRESSURE"]:  # always the REAL pressure (A35)
+                return f"ERR RESET refused: P={self.p_real:.2f}"
             self.set_state("IDLE", now_us)
             self.reason = "NONE"
             self.pump_allowed_in_trip = False
@@ -280,12 +315,33 @@ class Supervisor:
             self.auto_clear_us.clear()
             return "OK RESET -> IDLE"
         if cmd == "STATUS":
-            return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} "
+            return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} P_real={self.p_real:.3f} "
                     f"P_f={self.p_f:.3f} V_gpio={self.v_mv:.1f}mV u_open={self.u_open:.1f} "
                     f"integ={self.integ:.3f} zero={self.zero_offset:.3f} zero_ok={int(self.zero_ok)} "
                     f"latched={int(self.state == 'TRIPPED' and self.trip_latched)} "
                     f"auto_clears={self.auto_clears_in_window(now_us)}/{C['SOFT_AUTOCLEAR_MAX']}")
-        return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS LED MODE)"
+        if cmd.startswith("SIM RAMP"):
+            # A35: gate as START (A24); from IDLE or TEST.
+            parts = cmd.split()
+            rate = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else -1
+            if self.state not in ("IDLE", "TEST"):
+                return f"ERR SIM RAMP only from IDLE or TEST, state={self.state}"
+            if rate not in (10, 20, 30):
+                return "ERR SIM RAMP rate must be 10, 20 or 30 mbar/min"
+            if not ok or not self.pf_real_init:
+                return "ERR SIM RAMP needs a valid sensor sample"
+            if not self.zero_ok:
+                return "ERR SIM RAMP refused: no valid ZERO saved in NVS"
+            self.set_state("SIM", now_us)
+            self.sim_rate, self.sim_p0, self.sim_t0_us = rate, self.p_f_real, now_us
+            self.integ, self.pi_restart = 0.0, False
+            return f"OK SIM RAMP {rate} mbar/min from {self.sim_p0:.2f} mbar(g)"
+        if cmd == "SIM EXIT":
+            if self.state == "SIM":
+                self.set_state("IDLE", now_us)
+                return "OK IDLE (SIM ended: pump OFF, valve released)"
+            return f"ERR not in SIM, state={self.state}"
+        return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS SIM RAMP <n> SIM EXIT LED MODE)"
 
     def auto_clears_in_window(self, now_us: int) -> int:
         w = C["SOFT_AUTOCLEAR_WINDOW_S"] * 1_000_000
@@ -328,11 +384,16 @@ class Supervisor:
                 plaus_fail = True
         else:
             self.plaus_low_since_us = 0
-        hard = self.valid and self.p_raw >= C["P_HARD_LIMIT"]
+        # A35: limits on the control pressure AND, always, on the REAL pressure.
+        sim = self.sim_active
+        ctrl_ok = sim or self.valid
+        hard = ((self.valid and self.p_real >= C["P_HARD_LIMIT"])
+                or (sim and self.p_raw >= C["P_HARD_LIMIT"]))
         p_soft = self.p_raw
         if C["LAG_COMP_ENABLED"] and self.slope_ok:
             p_soft = max(self.p_raw, self.p_raw + C["LAG_COMP_S"] * self.slope)
-        soft = self.valid and p_soft >= C["P_SOFT_LIMIT"]
+        soft = ((ctrl_ok and p_soft >= C["P_SOFT_LIMIT"])
+                or (self.valid and self.p_real >= C["P_SOFT_LIMIT"]))
         loss = self.stale(now_us) or plaus_fail
         r = "HARD_LIMIT" if hard else "SOFT_LIMIT" if soft else "SENSOR_LOSS" if loss else "NONE"
         if self.state != "TRIPPED":
@@ -345,7 +406,7 @@ class Supervisor:
             self.reason = "HARD_LIMIT" if hard else "SENSOR_LOSS"
             return
         if (self.reason == "SOFT_LIMIT" and not self.trip_latched and r == "NONE" and self.valid
-                and not self.stale(now_us) and self.zero_ok and self.p_raw <= C["SOFT_AUTOCLEAR_P"]):
+                and not self.stale(now_us) and self.zero_ok and self.p_real <= C["SOFT_AUTOCLEAR_P"]):
             self.auto_clear(now_us)
 
     def compute_outputs(self) -> tuple[bool, float]:
@@ -355,7 +416,7 @@ class Supervisor:
         elif self.state == "TRIPPED":
             self.u_open = 100.0
             pump = self.pump_allowed_in_trip
-        elif self.state == "RUN":
+        elif self.state in ("RUN", "SIM"):  # A35: SIM = RUN on the simulated P_f
             pump = True
             if self.valid:
                 e = self.p_f - C["SETPOINT"]
@@ -378,9 +439,12 @@ class Supervisor:
         self.trip_new = False
         self.auto_clear_new = False
         self.validate(now_us, v_mv, read_ok)
+        self.update_control_pressure(now_us)
         if self.state == "BOOT" and self.valid:
             self.set_state("IDLE", now_us)
         reply = self.execute(cmd, now_us) if cmd else None
+        if self.state == "SIM" and now_us - self.sim_t0_us > C["TEST_PUMP_MAX_S"] * 1_000_000:
+            self.set_state("IDLE", now_us)  # A35 backstop (not reached: the ramp trips first)
         self.evaluate_trip(now_us, clock_us)
         pump, duty = self.compute_outputs()
         return pump, duty, reply
@@ -554,13 +618,16 @@ class Rig:
             s = self.sup
             # Leak model (A34) AFTER the supervisor step, like control_task.cpp.
             p_corr, p_comp, leak_rate = self.leak.update(
-                s.p_f if s.pf_init else NAN, self.model_pump_on, self.model_closed_duty)
+                s.p_f_real if s.pf_real_init else NAN, self.model_pump_on, self.model_closed_duty)
             self.model_pump_on, self.model_closed_duty = s.pump_on, s.valve_duty
             r4 = lambda x, n: None if math.isnan(x) else round(x, n)  # noqa: E731
             sample = {
                 "type": "sample", "seq": self.seq, "t_esp_ms": now_us // 1000,
                 "P_raw": None if math.isnan(s.p_raw) else round(s.p_raw, 4),
-                "P_f": round(s.p_f, 4) if s.pf_init else None, "valid": s.valid,
+                "P_f": round(s.p_f, 4) if s.pf_init else None,
+                "P_real": None if math.isnan(s.p_real) else round(s.p_real, 4),
+                "simulated": s.sim_active, "sim_rate": s.sim_rate if s.sim_active else 0,
+                "valid": s.valid,
                 "u_open": round(s.u_open, 4), "integ": round(s.integ, 5),
                 "valve_duty": round(s.valve_duty, 4), "pump_on": s.pump_on, "warning": s.warning,
                 "t_to_limit": round(s.t_to_limit, 2) if s.t_to_limit_ok else None,

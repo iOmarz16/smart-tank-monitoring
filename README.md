@@ -112,7 +112,7 @@ Serial commands (type and press Enter):
 |---|---|---|
 | `STATUS` | any | one-line state, pressure, V_gpio, PI, zero (`zero_ok`), IDLE time, trip timestamps; then free heap and free stack per task |
 | `START` | IDLE, sensor valid, **valid ZERO saved** | RUN: pump ON, PI active. Refused after a first flash, after `ZERO FORCE`, or if the zero could not be saved |
-| `STOP` | RUN, TEST | IDLE: pump OFF, valve OPEN |
+| `STOP` | RUN, TEST, SIM | IDLE: pump OFF, valve OPEN |
 | `RESET` | TRIPPED | back to IDLE, only if P < 20 mbar(g) and the sensor is valid. Needed for every latched trip. On a SOFT_LIMIT trip that would auto-clear, `RESET` goes to IDLE instead (the pump stays OFF) and starts a fresh auto-clear count |
 | `ZERO` | IDLE ≥ 60 s | stores the mean of the last 1 s of IDLE samples as the zero offset (NVS). Refused if the window is not steady (max − min > 0.3 mbar) or the offset is > ±3 mbar |
 | `ZERO FORCE` | IDLE ≥ 60 s | same, but accepts an offset beyond ±3 mbar, **up to ±5 mbar** (absolute cap). Prints a `WARN` line; `zero_forced=true` is then logged in every sample (and shown on the dashboard) until a normal `ZERO`. **`START` stays refused** with a forced zero |
@@ -123,8 +123,14 @@ Serial commands (type and press Enter):
 | `TEST VALVE ENERGIZE` / `RELEASE` | TEST | valve closed / open |
 | `TEST DUTY <0-100>` | TEST | valve energized (closed) duty %, 10 Hz PWM |
 | `TEST EXIT` | TEST | back to IDLE |
+| `SIM RAMP <10\|20\|30>` | IDLE or TEST, sensor valid, **valid ZERO saved** | **SIM (A35), trend testing / learning.** A simulated pressure ramps at 10, 20 or 30 mbar/min from the current real P_f and is THE pressure for PI, warning, slope, time-to-limit, the 20/29 trips and the dashboard. **Real outputs:** pump ON, PCV-101 driven by the PI on the simulated pressure (closed below 10 mbar(g), opening above). **Real protection stays on:** a trip also fires when the REAL pressure reaches 20 or 29 mbar(g), and the real stale / drop / open-circuit checks stay active. Any trip in SIM **latches** (RESET, checked on the real pressure) |
+| `SIM EXIT` | SIM | back to IDLE: pump OFF, valve released |
 
 In TEST mode the console prints `P_raw`, `P_f`, `V_gpio`, the pump state and the valve state at 5 Hz.
+In SIM it prints `SIM rate=... P_sim=... P_f=... slope=... warn=... t_to_limit=... P_real=... V_gpio=...`
+at 5 Hz. The dashboard shows only `SIM` in the state field; its pressure, status colour and chart
+follow the simulated pressure. `tools/analyze_log.py` reports every SIM run: fitted slope vs target
+(±10 %), warning lead before 20 mbar(g) and trip decision → output time.
 State changes are printed as `EVENT state=... trip_reason=...`; a trip line says either
 `LATCHED (RESET required)` or `auto-clears at P_raw <= 10.0`. Every auto-clear is logged as
 `EVENT AUTO-CLEAR SOFT_LIMIT -> RUN (bumpless PI restart) ... auto_clears=n/3`, and every sample

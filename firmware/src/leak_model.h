@@ -21,6 +21,13 @@ struct Result {
   float leak_rate;  // mbar/s: k * sqrt(P_corr), 0 at P_corr <= 0
 };
 
+// leak_rate (mbar/s) at P_corr; also used by the ring to rebuild the logged value.
+inline float rate(float p_corr, bool pump_on) {
+  if (isnan(p_corr)) return NAN;
+  const float k = pump_on ? K_LEAK_PUMP_ON : K_LEAK_PUMP_OFF;
+  return p_corr > 0.0f ? k * sqrtf(p_corr) : 0.0f;
+}
+
 class Model {
  public:
   // Call once per control loop, after Supervisor::step().
@@ -38,8 +45,7 @@ class Model {
       return r;
     }
     r.p_corr = p_f + (pump_on ? PUMP_ON_OFFSET : 0.0f);
-    const float k = pump_on ? K_LEAK_PUMP_ON : K_LEAK_PUMP_OFF;
-    r.leak_rate = r.p_corr > 0.0f ? k * sqrtf(r.p_corr) : 0.0f;
+    r.leak_rate = rate(r.p_corr, pump_on);
     if (!pump_on && r.p_corr < P_COMP_RESET_P) lost_ = 0.0f;  // vessel empty -> reset
     float frac = closed_duty / 100.0f;
     if (!(frac > 0.0f)) frac = 0.0f;  // also catches NaN

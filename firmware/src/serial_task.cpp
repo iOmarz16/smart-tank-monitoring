@@ -1,6 +1,7 @@
 // Serial task: core 0, low priority. Operator-only commands over USB (115200).
 //   ZERO [FORCE] | START | STOP | RESET | STATUS | LED MODE SAMPLE|VENT
 //   TEST | TEST PUMP ON [<s>]|OFF | TEST VALVE ENERGIZE|RELEASE | TEST DUTY <0-100> | TEST EXIT
+//   SIM RAMP <10|20|30> | SIM EXIT   (A35: simulated pressure ramp, real protection stays on)
 // Commands are queued to the control task, which owns all state and outputs.
 // All reply text is formatted here (core 0), never in the control task (review m9).
 #include <Arduino.h>
@@ -44,6 +45,18 @@ static bool parse(char *line, Command *cmd) {
   if (!strcmp(t1, "STOP")) { cmd->type = CmdType::STOP; return true; }
   if (!strcmp(t1, "RESET")) { cmd->type = CmdType::RESET; return true; }
   if (!strcmp(t1, "STATUS")) { cmd->type = CmdType::STATUS; return true; }
+  if (!strcmp(t1, "SIM")) {
+    // A35: SIM RAMP <10|20|30> | SIM EXIT. Other rates go to the supervisor (refused there).
+    if (!t2 || t4) return false;
+    if (!strcmp(t2, "EXIT") && !t3) { cmd->type = CmdType::SIM_EXIT; return true; }
+    if (strcmp(t2, "RAMP") || !t3) return false;
+    char *end = nullptr;
+    const long v = strtol(t3, &end, 10);
+    if (!end || *end) return false;
+    cmd->type = CmdType::SIM_RAMP;
+    cmd->arg = (v >= 0 && v <= 1000) ? (int)v : -1;
+    return true;
+  }
   if (strcmp(t1, "TEST")) return false;
   if (!t2) { cmd->type = CmdType::TEST_ENTER; return true; }
   if (!strcmp(t2, "EXIT")) { cmd->type = CmdType::TEST_EXIT; return true; }
@@ -88,7 +101,7 @@ static bool parse(char *line, Command *cmd) {
 static void printHelp() {
   Serial.printf("Commands: ZERO [FORCE], START, STOP, RESET, STATUS, LED MODE SAMPLE|VENT | "
                 "TEST, TEST PUMP ON [<1-%lu s, default %lu>]|OFF, TEST VALVE ENERGIZE|RELEASE, "
-                "TEST DUTY <0-100>, TEST EXIT\n",
+                "TEST DUTY <0-100>, TEST EXIT | SIM RAMP <10|20|30>, SIM EXIT\n",
                 (unsigned long)TEST_PUMP_MAX_S, (unsigned long)TEST_PUMP_DEFAULT_S);
 }
 
@@ -178,10 +191,11 @@ static void formatReply(const Reply &r, char *out, size_t n) {
     case ReplyCode::STATUS: {
       const StatusSnapshot &s = r.status;
       snprintf(out, n,
-               "state=%s trip=%s P_raw=%.3f P_f=%.3f V_gpio=%.1fmV valid=%d u_open=%.1f integ=%.3f "
+               "state=%s trip=%s P_raw=%.3f P_f=%.3f P_real=%.3f sim_rate=%u V_gpio=%.1fmV valid=%d u_open=%.1f integ=%.3f "
                "pump=%d duty=%.1f warning=%d zero=%.3f%s zero_ok=%d idle_s=%lu latched=%d "
                "auto_clears=%u/%d trip_dec_us=%llu trip_out_us=%llu adc_us=%lu adc_us_max=%lu",
                stateName(s.state), tripReasonName(s.reason), (double)s.p_raw, (double)s.p_f,
+               (double)s.p_real, (unsigned)s.sim_rate,
                (double)s.v_gpio_mv, s.valid ? 1 : 0, (double)s.u_open, (double)s.integ,
                s.pump_on ? 1 : 0, (double)s.duty, s.warning ? 1 : 0, (double)s.zero_offset,
                s.zero_forced ? "(FORCED)" : "", s.zero_ok ? 1 : 0, (unsigned long)s.idle_s,
@@ -221,6 +235,33 @@ static void formatReply(const Reply &r, char *out, size_t n) {
     case ReplyCode::ERR_TEST_EXIT:
       snprintf(out, n, "ERR not in TEST mode");
       return;
+    case ReplyCode::ERR_SIM_STATE:
+      snprintf(out, n, "ERR SIM RAMP only from IDLE or TEST, state=%s", st);
+      return;
+    case ReplyCode::ERR_SIM_RATE:
+      snprintf(out, n, "ERR SIM RAMP rate must be 10, 20 or 30 mbar/min");
+      return;
+    case ReplyCode::ERR_SIM_SENSOR:
+      snprintf(out, n, "ERR SIM RAMP needs a valid sensor sample");
+      return;
+    case ReplyCode::ERR_SIM_NO_ZERO:
+      snprintf(out, n, "ERR SIM RAMP refused: %s. Vent the vessel, wait %lu s in IDLE, then ZERO",
+               r.flag ? "zero set with ZERO FORCE" : "no valid ZERO saved in NVS",
+               (unsigned long)ZERO_MIN_IDLE_S);
+      return;
+    case ReplyCode::OK_SIM:
+      snprintf(out, n,
+               "OK SIM RAMP %d mbar/min from %.2f mbar(g): pump ON, PI drives PCV-101 on the "
+               "simulated pressure; REAL 20/29 mbar(g) trips and sensor checks stay active. "
+               "SIM EXIT or STOP ends it",
+               r.count, (double)r.value);
+      return;
+    case ReplyCode::OK_SIM_EXIT:
+      snprintf(out, n, "OK IDLE (SIM ended: pump OFF, valve released)");
+      return;
+    case ReplyCode::ERR_SIM_EXIT:
+      snprintf(out, n, "ERR not in SIM, state=%s", st);
+      return;
     case ReplyCode::ERR_UNKNOWN:
       break;
   }
@@ -258,7 +299,7 @@ static void persistZero(const Reply &r) {
 
 static void processReply(const Reply &r, bool late) {
   // Static (serial task only): it is printed before persistZero() can re-enter here.
-  static char text[256];
+  static char text[384];  // STATUS is the longest reply (~300 chars with P_real/SIM)
   formatReply(r, text, sizeof(text));
   if (late) Serial.print(F("LATE reply (command was executed): "));
   Serial.println(text);
@@ -384,6 +425,16 @@ void serialTask(void *) {
                       (double)s.p_raw, (double)s.p_f, (double)s.v_gpio_mv, s.valid ? 1 : 0,
                       s.pump_on ? "ON" : "OFF", valve, (double)s.valve_duty, (double)s.p_corr,
                       (double)s.p_comp_assumed, (double)s.leak_rate);
+      }
+      // SIM RAMP (A35): 5 Hz live print, simulated and REAL pressure side by side.
+      if (s.state == State::SIM && millis() - last_print >= TEST_PRINT_PERIOD_MS) {
+        last_print = millis();
+        Serial.printf("SIM rate=%u P_sim=%.3f P_f=%.3f slope=%.3f warn=%d t_to_limit=%.1f "
+                      "P_real=%.3f V_gpio=%.1fmV valid=%d u_open=%.1f duty=%.0f%%\n",
+                      (unsigned)s.sim_rate, (double)s.p_raw, (double)s.p_f, (double)s.slope,
+                      s.warning ? 1 : 0, (double)s.t_to_limit, (double)s.p_real,
+                      (double)s.v_gpio_mv, s.valid ? 1 : 0, (double)s.u_open,
+                      (double)s.valve_duty);
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));

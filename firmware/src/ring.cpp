@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "leak_model.h"  // leak::rate() only, to rebuild the logged leak_rate
 
 // Memory fix (A33). The first version held 1500 full Sample structs (96 B) in ONE
 // calloc of 144 KB, larger than the largest free block of the ESP32 heap (~110 KB), so
@@ -31,7 +32,7 @@ constexpr float SC_ZERO = 5000.0f;  // zero_offset: 0.0002 mbar, +/-6.55 (cap is
 // Leak model (A34), log only. P_comp grows without bound while the pump runs with the
 // vent closed, so it gets a wide range: 0.02 mbar, +/-655 mbar (saturates beyond).
 constexpr float SC_PCOMP = 50.0f;
-constexpr float SC_LEAK = 10000.0f; // leak_rate: 0.0001 mbar/s, +/-3.27 (max ~2 at 46 mbar)
+// P_corr: same scale as P_raw (0.002 mbar). leak_rate is not stored (rebuilt, see Packed).
 constexpr int16_t S16_NAN = INT16_MIN;
 
 struct Packed {
@@ -55,9 +56,11 @@ struct Packed {
   uint32_t test_pump_timeout : 1;
   uint32_t trip_latched : 1;
   uint32_t auto_clear_event : 1;
-  uint32_t leak_pump_on : 1;  // leak model pump state; P_corr = P_f + PUMP_ON_OFFSET if set
+  uint32_t leak_pump_on : 1;  // leak model pump state (selects k for the rebuilt leak_rate)
   uint32_t auto_clears : 4;
   uint32_t reset_reason : 5;
+  uint32_t simulated : 1;     // A35: control pressure was the SIM RAMP pressure
+  uint32_t sim_rate : 2;      // A35: SIM RAMP rate / 10 (1, 2, 3), 0 = not simulated
   uint16_t v_gpio;
   int16_t p_raw;
   int16_t p_f;
@@ -68,18 +71,21 @@ struct Packed {
   int16_t zero_offset;
   uint16_t trip_dec_hi;       // trip_decision_us, bits 32..47 (8.9 years of uptime)
   uint16_t out_delta1;        // trip_output_us - trip_decision_us + 1 (saturates); 0 = none
-  // Leak model (A34). P_corr is not stored: it is exactly P_f + PUMP_ON_OFFSET when
-  // leak_pump_on is set, else P_f (NaN with P_f), so it costs one bit instead of 16.
+  // Leak model (A34). leak_rate is not stored: it is k(leak_pump_on) * sqrt(P_corr),
+  // rebuilt from P_corr (A35: P_corr is stored because in SIM it follows the REAL P_f,
+  // not the logged P_f). P_real is not stored either: in SIM it is rebuilt exactly as
+  // the supervisor computes it, v_gpio_mv x 0.015 - zero_offset; outside SIM = P_raw.
   int16_t p_comp;
-  int16_t leak_rate;
+  int16_t p_corr;
 };
 static_assert(sizeof(Packed) == 48, "packed sample layout changed");
 static_assert(RING_SAMPLES % RING_CHUNK_SAMPLES == 0, "RING_SAMPLES must be a multiple of the chunk");
 static_assert(RING_SAMPLES >= 900, "ring must hold >= 900 samples (60 s outage + margin): ask first");
-static_assert((int)State::TRIPPED < 8 && (int)TripReason::HARD_LIMIT < 4 &&
+static_assert((int)State::SIM < 8 && (int)TripReason::HARD_LIMIT < 4 &&
                   (int)T3Source::READBACK_TIMEOUT < 4,
               "enum does not fit its bitfield");
 static_assert(SOFT_AUTOCLEAR_MAX < 16, "auto_clears does not fit its bitfield");
+// The full 32-bit flag word is used; read_ok is always true on the ESP32 (P_real rebuild).
 
 constexpr uint32_t N_CHUNKS = RING_SAMPLES / RING_CHUNK_SAMPLES;
 
@@ -150,7 +156,9 @@ void pack(const Sample &s, Packed *p) {
   p->zero_offset = encS16(s.zero_offset, SC_ZERO);
   p->leak_pump_on = s.leak_pump_on;
   p->p_comp = encS16(s.p_comp_assumed, SC_PCOMP);
-  p->leak_rate = encS16(s.leak_rate, SC_LEAK);
+  p->p_corr = encS16(s.p_corr, SC_P);
+  p->simulated = s.simulated;
+  p->sim_rate = s.simulated ? (s.sim_rate / 10) & 3 : 0;
 }
 
 void unpack(const Packed &p, uint32_t seq, Sample *s) {
@@ -188,9 +196,16 @@ void unpack(const Packed &p, uint32_t seq, Sample *s) {
   s->valve_duty = decU16(p.valve_duty, SC_PCT);
   s->zero_offset = decS16(p.zero_offset, SC_ZERO);
   s->leak_pump_on = p.leak_pump_on;
-  s->p_corr = s->p_f + (p.leak_pump_on ? PUMP_ON_OFFSET : 0.0f);  // NaN stays NaN
+  s->p_corr = decS16(p.p_corr, SC_P);
   s->p_comp_assumed = decS16(p.p_comp, SC_PCOMP);
-  s->leak_rate = decS16(p.leak_rate, SC_LEAK);
+  s->leak_rate = leak::rate(s->p_corr, p.leak_pump_on);
+  s->simulated = p.simulated;
+  s->sim_rate = (uint8_t)(p.sim_rate * 10);
+  // P_real: outside SIM it is P_raw; in SIM, the supervisor formula on the stored pin
+  // voltage and zero offset (0.0015 mbar resolution). read_ok is always true here.
+  s->p_real = p.simulated ? s->v_gpio_mv * (SENSOR_DIVIDER_RATIO * SENSOR_MBAR_PER_V / 1000.0f) - s->zero_offset
+                          : s->p_raw;
+  s->p_f_real = NAN;  // internal, not logged
 }
 
 Packed *slot(uint32_t seq) {
@@ -250,7 +265,7 @@ bool selfTest() {
   a.leak_pump_on = true;
   a.p_corr = NAN;  // P_f is NaN here
   a.p_comp_assumed = 123.456f;
-  a.leak_rate = 0.0876f;
+  a.leak_rate = NAN;
   Packed p{};
   pack(a, &p);
   Sample b;
@@ -267,25 +282,40 @@ bool selfTest() {
             near(b.t_to_limit, a.t_to_limit, 0.01f) && near(b.u_open, a.u_open, 0.005f) &&
             near(b.valve_duty, a.valve_duty, 0.005f) && near(b.zero_offset, a.zero_offset, 0.0001f) &&
             near(b.p_corr, a.p_corr, 0.0f) && near(b.p_comp_assumed, a.p_comp_assumed, 0.01f) &&
-            near(b.leak_rate, a.leak_rate, 0.00005f) && b.leak_pump_on;
-  // Leak model (A34): P_corr rebuilt from P_f and the pump bit.
+            near(b.leak_rate, a.leak_rate, 0.0f) && b.leak_pump_on && !b.simulated &&
+            b.sim_rate == 0 && near(b.p_real, b.p_raw, 0.0f);
+  // Leak model (A34): P_corr stored, leak_rate rebuilt with the k of the pump bit.
   Sample d{};
   d.p_f = 5.0f;
   d.leak_pump_on = true;
   d.p_corr = d.p_f + PUMP_ON_OFFSET;
   d.p_comp_assumed = NAN;
-  d.leak_rate = NAN;
+  d.leak_rate = K_LEAK_PUMP_ON * sqrtf(d.p_corr);
   pack(d, &p);
   unpack(p, 0, &b);
   ok = ok && b.leak_pump_on && near(b.p_corr, d.p_corr, 0.001f) && isnan(b.p_comp_assumed) &&
-       isnan(b.leak_rate);
+       near(b.leak_rate, d.leak_rate, 0.0001f);
   d.leak_pump_on = false;
   d.p_corr = d.p_f;
+  d.leak_rate = K_LEAK_PUMP_OFF * sqrtf(d.p_corr);
   d.p_comp_assumed = 999.0f;  // saturates at 32767 / SC_PCOMP = 655.34
   pack(d, &p);
   unpack(p, 0, &b);
   ok = ok && !b.leak_pump_on && near(b.p_corr, 5.0f, 0.001f) &&
-       near(b.p_comp_assumed, 32767.0f / SC_PCOMP, 0.0f);
+       near(b.leak_rate, d.leak_rate, 0.0001f) && near(b.p_comp_assumed, 32767.0f / SC_PCOMP, 0.0f);
+  // SIM (A35): control pressure simulated, P_real rebuilt from the pin voltage and zero.
+  Sample e{};
+  e.state = State::SIM;
+  e.simulated = true;
+  e.sim_rate = 30;
+  e.p_raw = 17.25f;                  // simulated
+  e.v_gpio_mv = 314.0f;              // real pin voltage
+  e.zero_offset = 2.13f;
+  e.p_real = 314.0f * 0.015f - 2.13f;  // 2.58 mbar(g), as the supervisor computes it
+  pack(e, &p);
+  unpack(p, 0, &b);
+  ok = ok && b.state == State::SIM && b.simulated && b.sim_rate == 30 &&
+       near(b.p_raw, 17.25f, 0.001f) && near(b.p_real, e.p_real, 0.002f);
   // No trip: all trip times 0. Out of range values saturate instead of wrapping.
   Sample c{};
   c.p_raw = 99.0f;

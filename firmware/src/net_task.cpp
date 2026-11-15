@@ -81,7 +81,7 @@ static void startAccessPoint() {
 // Returns false if the sample could not be sent (client gone); true otherwise
 // (a sample missing from the ring or failing to format is skipped).
 static bool sendSample(uint8_t client, uint32_t seq, bool replayed) {
-  static char buf[1024];  // worst-case sample ~810 bytes (with the A34 leak fields)
+  static char buf[1024];  // worst-case sample ~860 bytes (with the A34 leak and A35 SIM fields)
   Sample s;
   if (!ring::get(seq, &s)) return true;
   const size_t len = formatSampleJson(s, replayed, buf, sizeof(buf));

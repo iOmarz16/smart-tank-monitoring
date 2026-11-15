@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-enum class State : uint8_t { BOOT = 0, IDLE, RUN, TEST, TRIPPED };
+// SIM (A35) is appended so the logged numeric values of the other states do not change.
+enum class State : uint8_t { BOOT = 0, IDLE, RUN, TEST, TRIPPED, SIM };
 enum class TripReason : uint8_t { NONE = 0, SOFT_LIMIT, SENSOR_LOSS, HARD_LIMIT };
 // Where t3 (outputs actually changed) comes from, test I3a.
 enum class T3Source : uint8_t { NONE = 0, SOFTWARE, READBACK, READBACK_TIMEOUT };
@@ -19,8 +20,12 @@ struct Sample {
   uint32_t t_esp_ms;        // ESP32 clock (esp_timer) at loop start
   uint32_t loop_period_us;  // micros() between this loop start and the previous one
   float v_gpio_mv;          // averaged ADC reading at GPIO34
-  float p_raw;              // mbar(g), zero offset applied (NaN if read failed)
-  float p_f;                // filtered pressure, held while invalid
+  float p_raw;              // mbar(g) control pressure: the real one, or the simulated one in SIM (A35)
+  float p_f;                // filtered control pressure, held while invalid
+  float p_real;             // mbar(g) REAL sensor pressure, zero applied (= p_raw outside SIM; NaN if read failed)
+  float p_f_real;           // internal (not in the JSON): real filtered pressure, input of the leak model
+  bool simulated;           // this sample's control pressure is the SIM RAMP pressure (A35)
+  uint8_t sim_rate;         // mbar/min of the SIM RAMP (10/20/30), 0 when not simulated
   float slope;              // 5-sample regression of P_f, mbar/s
   float t_to_limit;         // s, NaN when slope <= MIN_WARNING_SLOPE
   float u_open;             // vent opening %, 0..100
@@ -68,6 +73,8 @@ enum class CmdType : uint8_t {
   TEST_VALVE,   // arg 0 = release (open), 1 = energize (closed)
   TEST_DUTY,    // arg 0..100 = energized (closed) duty %
   TEST_EXIT,
+  SIM_RAMP,     // arg = mbar/min (10, 20 or 30; anything else is refused)
+  SIM_EXIT,
   LED_MODE,     // arg = LedMode; handled by the control task glue, not the supervisor
   ZERO_UNSAVED, // internal: the serial task could not persist the new zero to NVS
 };
@@ -111,12 +118,20 @@ enum class ReplyCode : uint8_t {
   ERR_TEST_DURATION,   // TEST PUMP ON duration outside 1..TEST_PUMP_MAX_S; pump unchanged
   OK_TEST_EXIT,
   ERR_TEST_EXIT,
+  ERR_SIM_STATE,       // state
+  ERR_SIM_RATE,        // count = requested rate
+  ERR_SIM_SENSOR,
+  ERR_SIM_NO_ZERO,     // flag = active zero was forced
+  OK_SIM,              // count = rate, value = start pressure
+  OK_SIM_EXIT,
+  ERR_SIM_EXIT,        // state
 };
 
 struct StatusSnapshot {
   State state;
   TripReason reason;
-  float p_raw, p_f, v_gpio_mv, u_open, integ, duty, zero_offset;
+  float p_raw, p_f, p_real, v_gpio_mv, u_open, integ, duty, zero_offset;
+  uint8_t sim_rate;  // 0 when not in SIM
   bool valid, pump_on, warning, zero_forced, zero_ok, trip_latched;
   uint8_t auto_clears;
   uint32_t idle_s;  // s in IDLE (0 outside IDLE)
