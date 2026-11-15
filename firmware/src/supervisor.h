@@ -8,7 +8,7 @@
 //   2. execute at most one operator command (serial only)
 //   3. evaluate the trip (every state, BEFORE PI); a trip latches, except a SOFT_LIMIT
 //      trip from RUN, which may auto-clear at P <= SOFT_AUTOCLEAR_P (A30)
-//   4. compute outputs for the current state (PI in RUN and in SIM, A35)
+//   4. compute outputs for the current state (PI in RUN; in SIM computed and logged only, A35)
 #pragma once
 
 #include <stdint.h>

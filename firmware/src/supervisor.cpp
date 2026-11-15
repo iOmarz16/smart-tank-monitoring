@@ -620,9 +620,10 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
       u_open_ = 100.0f - test_duty_;
       break;
     case State::SIM:
-      // A35 (user decision): as RUN, but the PI acts on the simulated P_f. Below the
-      // setpoint it keeps the vent closed, above it opens the vent; the real 20/29 trips
-      // and the real sensor checks stay active in evaluateTrip().
+      // A35 (revised 2026-11-16): pump ON and PCV-101 ENERGIZED (closed) at 100 % for the
+      // whole run. The PI runs on the simulated P_f and u_open / integ are logged, but it
+      // does NOT drive the valve (see the override below). The real 20/29 trips and the real
+      // sensor checks stay active in evaluateTrip(); a trip applies the normal TRIPPED outputs.
     case State::RUN:
       o.pump_on = true;
       if (valid_) {
@@ -641,6 +642,11 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
       // else: sensor fault (< 0.5 s): integrator frozen, last duty held (Fig. 7, A4).
       o.valve_duty = 100.0f - u_open_;  // normally open: energized (closed) = 100 - u_open
       o.valve_safe = o.valve_duty <= 0.0f;
+      if (state_ == State::SIM) {
+        // A35: PI output computed and logged only; the vent stays closed.
+        o.valve_duty = 100.0f;
+        o.valve_safe = false;
+      }
       break;
   }
   pump_on_ = o.pump_on;

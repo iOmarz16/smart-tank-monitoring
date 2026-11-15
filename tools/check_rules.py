@@ -363,7 +363,7 @@ r, rep = sim_run(rate=20, real=3.0)
 check("A35 SIM RAMP accepted from IDLE, starts at the real P_f", r.s.state == "SIM" and abs(r.s.sim_p0 - 3.0) < 1e-6,
       rep)
 r.step(3.0 * MV_PER_MBAR)
-check("A35 in SIM: pump ON, vent closed by the PI below the setpoint",
+check("A35 in SIM: pump ON, PCV-101 energized (closed) at 100 %",
       r.s.pump_on and r.s.valve_duty == 100.0 and r.s.sim_active, f"duty={r.s.valve_duty}")
 p_a, t_a = r.s.p_raw, r.t
 r.hold(3.0 * MV_PER_MBAR, 10)
@@ -372,7 +372,8 @@ check("A35 simulated pressure ramps at the commanded rate", abs(rate_meas - 20.0
 check("A35 real pressure is kept separately (P_real)", abs(r.s.p_real - 3.0) < 1e-6 and r.s.p_raw > 5.0,
       f"P_sim={r.s.p_raw:.2f} P_real={r.s.p_real:.2f}")
 r.hold(3.0 * MV_PER_MBAR, 15)  # sim ~ 11.3: above the setpoint
-check("A35 PI opens PCV-101 on the simulated pressure above the setpoint", r.s.u_open > 0.0 and r.s.valve_duty < 100.0,
+check("A35 above the setpoint the PI is computed (u_open > 0) but the vent stays closed (duty 100 %)",
+      r.s.u_open > 0.0 and r.s.valve_duty == 100.0 and r.s.pump_on,
       f"P_sim={r.s.p_raw:.2f} u_open={r.s.u_open:.1f}")
 
 # Full ramps: warning before 20, SOFT_LIMIT trip on the simulated pressure, latched.
@@ -403,6 +404,35 @@ for rate in (10, 20, 30):
     check(f"A35 SIM {rate}: RESET uses the real pressure (2.6 < 20) -> IDLE", r.s.state == "IDLE", rep)
 print(f"  info: SIM warning leads before the trip: "
       + ", ".join(f"{k} mbar/min {v:.1f} s" if v is not None else f"{k}: none" for k, v in leads.items()))
+
+# Rig case (SIM RAMP rig result 2026-11-16): the REAL reading follows the valve. Pump ON with
+# the vent closed holds the rig plateau (~350 mV, zero 2.13 mbar); an open vent vents the
+# real pressure toward 0 (142 mV, the ADC floor). The earlier PI-drives-valve version opened
+# the vent above 10 mbar(g) simulated and tripped SENSOR_LOSS at P_sim 15.05 on the rig.
+# Every rate must now end with a SOFT_LIMIT trip at the simulated 20 mbar(g).
+PLATEAU_MV, VENTED_MV, TAU_S = 350.0, 142.0, 5.0
+for rate in (10, 20, 30):
+    for start_mv in (PLATEAU_MV, VENTED_MV):  # already at the plateau, or from a vented vessel
+        r = Run(zero_ok=True, zero=RIG_ZERO)
+        r.hold(start_mv, 1)
+        mv = start_mv
+        r.step(mv, f"SIM RAMP {rate}")
+        min_mv, end = float("inf"), None
+        for _ in range(int((20.0 - (start_mv * 0.015 - RIG_ZERO)) / rate * 600) + 100):
+            closed = r.s.pump_on and r.s.valve_duty / 100.0
+            target = VENTED_MV + (PLATEAU_MV - VENTED_MV) * (closed or 0.0)
+            mv += (target - mv) * (0.1 / TAU_S)
+            r.step(mv)
+            if r.s.sim_active and r.s.state == "SIM":
+                min_mv = min(min_mv, mv) if r.s.p_raw > 10.0 else min_mv
+            if r.s.state == "TRIPPED":
+                end = (r.s.reason, r.s.p_raw, r.s.sim_active, r.s.trip_latched, r.s.pump_on, r.s.valve_duty)
+                break
+        check(f"A35 rig plateau {rate} mbar/min from {start_mv:.0f} mV: SOFT_LIMIT at simulated 20, not SENSOR_LOSS",
+              end is not None and end[0] == "SOFT_LIMIT" and end[1] >= 20.0 and end[2] and end[3],
+              f"{end} min real V_gpio above sim 10: {min_mv:.0f} mV")
+        check(f"A35 rig plateau {rate} mbar/min from {start_mv:.0f} mV: trip outputs pump OFF, valve released",
+              end is not None and not end[4] and end[5] == 0.0, str(end))
 
 # Real background protection while the simulated pressure is low.
 r, _ = sim_run(rate=10, real=3.0)

@@ -38,9 +38,9 @@ trips run on the unquantized values.
 | `simulated` | `true` when this sample's `P_raw` / `P_f` / slope / warning come from SIM RAMP (A35). The sample that decides a trip in SIM is still `true`; the next one is real again. The CSV writes 0/1 |
 | `sim_rate` | SIM RAMP rate, mbar/min (10, 20, 30); 0 when not simulated |
 | `valid` | sample passed range + drop checks |
-| `u_open` | vent opening % (PI output in RUN; 100 in IDLE/TRIPPED) |
+| `u_open` | vent opening % (PI output in RUN; 100 in IDLE/TRIPPED). In SIM: PI output on the simulated pressure, logged only, NOT applied (A35) |
 | `integ` | PI integrator Σe (mbar·samples) **after** this loop's update |
-| `valve_duty` | PCV-101 energized (closed) duty %; RUN: `100 − u_open` |
+| `valve_duty` | PCV-101 energized (closed) duty %; RUN: `100 − u_open`; SIM: 100 (vent closed for the whole run, A35) |
 | `t_to_limit` | s to 20 mbar(g); `null` when slope ≤ `MIN_WARNING_SLOPE` |
 | `state` | `BOOT` · `IDLE` · `RUN` · `TEST` · `TRIPPED` · `SIM` (A35) |
 | `trip_reason` | `NONE` · `SOFT_LIMIT` · `SENSOR_LOSS` · `HARD_LIMIT` |

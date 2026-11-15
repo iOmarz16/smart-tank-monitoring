@@ -251,9 +251,9 @@ static void formatReply(const Reply &r, char *out, size_t n) {
       return;
     case ReplyCode::OK_SIM:
       snprintf(out, n,
-               "OK SIM RAMP %d mbar/min from %.2f mbar(g): pump ON, PI drives PCV-101 on the "
-               "simulated pressure; REAL 20/29 mbar(g) trips and sensor checks stay active. "
-               "SIM EXIT or STOP ends it",
+               "OK SIM RAMP %d mbar/min from %.2f mbar(g): pump ON, PCV-101 ENERGIZED (closed) "
+               "100%%; PI on the simulated pressure is logged only. REAL 20/29 mbar(g) trips and "
+               "sensor checks stay active. SIM EXIT or STOP ends it",
                r.count, (double)r.value);
       return;
     case ReplyCode::OK_SIM_EXIT:

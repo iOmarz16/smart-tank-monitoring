@@ -416,7 +416,7 @@ class Supervisor:
         elif self.state == "TRIPPED":
             self.u_open = 100.0
             pump = self.pump_allowed_in_trip
-        elif self.state in ("RUN", "SIM"):  # A35: SIM = RUN on the simulated P_f
+        elif self.state in ("RUN", "SIM"):  # A35: in SIM the PI is computed and logged only
             pump = True
             if self.valid:
                 e = self.p_f - C["SETPOINT"]
@@ -431,6 +431,8 @@ class Supervisor:
                     self.integ = s
                 self.u_open = min(100.0, max(0.0, C["KC"] * (e + k * self.integ)))
             duty = 100.0 - self.u_open
+            if self.state == "SIM":
+                duty = 100.0  # A35: PCV-101 energized (closed) for the whole SIM run
         self.pump_on = pump
         self.valve_duty = max(0.0, duty)
         return pump, self.valve_duty
