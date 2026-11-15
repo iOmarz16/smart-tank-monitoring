@@ -94,7 +94,25 @@ p = 0.0
 for _ in range(400):  # 40 s
     p += 10.0 / 60.0 * 0.1
     r.step(max(120.0, p * MV_PER_MBAR))
-check("10 mbar/min ramp passes 250 mV before 30 s", r.s.state == "RUN", f"{r.s.state}/{r.s.reason}")
+check(f"10 mbar/min ramp passes {C['OPEN_CIRCUIT_MV_THRESHOLD']:.0f} mV before 30 s", r.s.state == "RUN", f"{r.s.state}/{r.s.reason}")
+
+# 3b. A25 measured threshold (bench, reported 2026-11-16): open circuit reads 142.0 mV steady,
+#     147.7 mV max; rig zero offset 2.13 mbar; pump-ON plateau P_raw 2.6 = 314 mV.
+check("A25 threshold = measured 180 mV, above the 147.7 mV open-circuit max, <= 300 mV",
+      C["OPEN_CIRCUIT_MV_THRESHOLD"] == 180.0 and 147.7 < C["OPEN_CIRCUIT_MV_THRESHOLD"] <= 300.0)
+r = Run(zero_ok=True, zero=2.13)
+r.hold(142.0, 1)
+r.step(142.0, "START")  # open circuit looks like a vented vessel (P_raw ~ 0)
+r.hold(147.7, 31)       # worst-case open-circuit noise for the whole window
+check("A25 open circuit at the 147.7 mV max trips SENSOR_LOSS after 30 s",
+      r.s.state == "TRIPPED" and r.s.reason == "SENSOR_LOSS", f"{r.s.state}/{r.s.reason}")
+r = Run(zero_ok=True, zero=2.13)
+r.hold(142.0, 1)
+r.step(142.0, "START")
+r.to(2.6 + 2.13, rate=0.05)  # pump plateau with the vent closed: P_raw 2.6 = 314 mV
+r.hold(314.0, 300)           # the team's 300 s pump-ON run
+check("A25 healthy pump plateau (314 mV) runs 300 s without SENSOR_LOSS", r.s.state == "RUN",
+      f"{r.s.state}/{r.s.reason}")
 
 # 4. M3: ZERO only from steady IDLE samples, FORCE capped.
 r = Run(zero_ok=True)

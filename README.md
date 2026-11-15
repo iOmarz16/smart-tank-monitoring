@@ -241,8 +241,10 @@ connect anything that pulls GPIO2 high**; otherwise the board cannot enter flash
 
 ### 3.3 Bench open-circuit measurement (sets `OPEN_CIRCUIT_MV_THRESHOLD`)
 
-`OPEN_CIRCUIT_MV_THRESHOLD` in `config.h` is **provisional (250 mV)**. Measure the real
-open-circuit reading of your board once, before any pressurized run:
+`OPEN_CIRCUIT_MV_THRESHOLD` in `config.h` is **180 mV, measured** (reported 2026-11-16: 0 V at the
+sensor input reads a steady 142.0 mV, max 147.7 mV; A25). Repeat this measurement if the board, the
+÷5 module or the wiring changes, and once more for step 6 after the 1 MΩ pull-down is fitted.
+Procedure:
 
 1. Vessel vented (lid open or HV-101 open). IDLE. Start the dashboard so every sample, including
    `v_gpio_mv` and `P_raw`, is logged to the CSV; Wi-Fi active, since radio noise is part of the

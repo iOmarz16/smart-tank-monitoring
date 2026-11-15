@@ -61,11 +61,12 @@ offset was 0.0 (first flash, nothing in NVS): the open circuit looks like a vent
 Mitigation (user decisions, Q5 and review C1/M1):
 1. **Open-circuit check on the raw voltage** (A19): pump commanded ON (any state) and
    `v_gpio_mv` < `OPEN_CIRCUIT_MV_THRESHOLD` for > `PLAUS_TIMEOUT_MS` = 30 s → `SENSOR_LOSS`.
-   The threshold (provisional 250 mV) is set from the bench open-circuit measurement
+   The threshold is **180 mV, measured** (A25) from the bench open-circuit measurement
    (README 3.3). Constraint on it: at the slowest Spec 1 ramp (10 mbar/min) a healthy rig from
    0 mbar(g) must cross it well inside 30 s. With the ÷5 module (A29), 5 mbar(g) at 30 s = 333 mV,
-   so keep it ≤ ~300 mV (4.5 mbar(g), crossed at 27 s). At 250 mV (3.75 mbar(g)) the slowest ramp
-   crosses after ~22.5 s. (With the old 33k/10k divider the bound was ~350 mV.)
+   so keep it ≤ ~300 mV (4.5 mbar(g), crossed at 27 s). At 180 mV a vented rig already reads ~142 mV
+   (the 2.13 mbar zero offset is the ADC floor), so the slowest ramp
+   crosses after a few seconds (~0.6 mbar(g) above vented). (With the old 33k/10k divider the bound was ~350 mV.)
 2. **START needs a valid, non-forced ZERO in NVS** (A24).
 
 Residual risk: in those 30 s with an undetected open circuit the pump adds, unseen, up to 15 mbar(g)
@@ -76,7 +77,7 @@ the blind reading cannot see; the 30 s open-circuit trip then vents. **There is 
 reached in 30 s). A fault in RUN at steady 10 mbar(g) is caught by the drop check. The check also
 trips, as expected, when the pump runs into a vessel that cannot pressurize: FI-101 closed, lid
 open, HV-101 open, or TEST with the vent released and low inflow (open vent at 98.7 std cm³/min
-settles near 4 mbar(g) ≈ 267 mV with the ÷5 module, **just above** the provisional 250 mV).
+settles near 4 mbar(g) ≈ 400 mV with the ÷5 module and the 2.13 mbar zero offset, well above 180 mV).
 
 **Floating input (A32, DECIDED: 1 MΩ pull-down).** The ÷5 module's bottom resistor pulls GPIO34 to 0 V only while the
 module-to-ESP32 wire is intact. If that wire breaks, GPIO34 (no internal pull resistor) floats,
@@ -118,17 +119,17 @@ fitting it. `SENSOR_DIVIDER_RATIO` stays 5.0 unless the team decides to correct 
 - **A33** heap: read the `HEAP` boot lines on the real board; ≥ 40 KB must remain after Wi-Fi
   (ring now 72 KB at 48 B/sample since A34, was 66 KB).
 - **A34** leak model constants are provisional until the ADC-floor zero check; P_comp is display only.
-- **A34 / A25 note:** the team file reports a pump plateau of ~3.4 mbar(g) with the vent closed.
-  That is ~227 mV at GPIO34 (+ zero error), **below** `OPEN_CIRCUIT_MV_THRESHOLD` = 250 mV. With
-  this firmware, any pump-ON run (RUN or TEST) that stays below ~3.75 mbar(g) for 30 s trips
-  SENSOR_LOSS by design (A19). Not changed (thresholds need the team); decide together with A25.
+- ~~A34 / A25 note~~ **withdrawn** (team correction, 2026-11-16): my ~227 mV plateau estimate left
+  out the 2.13 mbar zero offset. On the rig P_raw = 2.6 read V_gpio = 314 mV; the plateau sits at
+  ~350 mV, and the team's 300 s pump-ON run on this firmware did not trip SENSOR_LOSS.
+- ~~A25 threshold~~ **resolved** (team, 2026-11-16): `OPEN_CIRCUIT_MV_THRESHOLD` = 180 mV, measured
+  (see A25). The module-to-GPIO34 wire case with the 1 MΩ pull-down (README 3.3 step 6) is still
+  open under A32.
 - **A31** ADC read time of 32 reads: estimated, not measured. Read it from `STATUS` at bring-up.
 - **A29** noise without the 100 nF: check the ZERO spread rule (≤ 0.3 mbar = 20 mV) on the rig.
 - **A30 / P5 step 3**: there is no agreed way to cause a SOFT_LIMIT trip in RUN on the rig (the open
   vent out-vents the pump), so the auto-clear is tested only on the Python port so far.
 - MOSFET module polarity (low-side) to be measured before the read-back is wired (A18).
-- **A25** `OPEN_CIRCUIT_MV_THRESHOLD = 250` mV is provisional: set it from the bench open-circuit
-  measurement (README 3.3) before any pressurized run.
 - ~~A26 vs P2~~ resolved (user, 2026-11-15): `TEST PUMP ON <seconds>`, see A26. P2 at
   10 mbar/min (~120 s to 20 mbar(g)) runs with one command, e.g. `TEST PUMP ON 180`.
 - **P1 BLOCKED pending CHE** (user decision, 2026-11-15) — Table G P1 holds 25 mbar(g), vent closed,
@@ -156,7 +157,7 @@ counted it as a layer was wrong and is corrected here.
 | # | Decision / assumption | Status |
 |---|---|---|
 | A24 | `START` is refused unless a **valid, non-forced zero exists in NVS**. Valid at boot = key `zero` present, `zforced` false, finite, \|zero\| ≤ 3.0 mbar (`ZERO_MAX_ABS_OFFSET`). In a session, a normal `ZERO` sets it, `ZERO FORCE` clears it. The serial task writes the zero to NVS and reads it back; if that fails it tells the control task (`ZERO_UNSAVED`), which clears it again, so an offset that is active in RAM but not saved does not allow `START`. | CONFIRMED (user, review C1) |
-| A25 | `OPEN_CIRCUIT_MV_THRESHOLD` = 250 mV, **provisional**, to be set to the bench open-circuit maximum + margin, ≤ ~300 mV with the ÷5 module (section C, A29). | OPEN (bench measurement) |
+| A25 | `OPEN_CIRCUIT_MV_THRESHOLD` = **180 mV, measured** (bench open-circuit test, README 3.3, reported 2026-11-16): 0 V at the sensor input reads a steady 142.0 mV at GPIO34, max noise 147.7 mV → 32 mV margin. Rule kept: max + margin, ≤ ~300 mV with the ÷5 module (section C, A29). Was 250 mV provisional. Healthy rig: vented ~142 mV (= the 2.13 mbar zero offset), pump-ON plateau with the vent closed ~350 mV. | CONFIRMED (team, measured); module-to-GPIO34 wire case open under A32 |
 | A26 | TEST pump duration: `TEST PUMP ON [<seconds>]`, default `TEST_PUMP_DEFAULT_S` = 60 s, hard cap `TEST_PUMP_MAX_S` = 300 s. A duration < 1 or > 300 s is refused (`ERR`, pump unchanged); the supervisor checks the range again itself. When the time is up the control task switches the pump OFF and the console prints `EVENT TEST pump OFF`. All trips and the open-circuit check stay enforced. Replaces the earlier "every `TEST PUMP ON` restarts a 60 s window" rule. A new `TEST PUMP ON` while the pump is ON **replaces** the remaining time (does not add), so one command never runs the pump longer than 300 s. | Duration argument, default and cap CONFIRMED (user, 2026-11-15); replace-not-add ASSUMED |
 | A27 | Watchdog freeze path (review M2). (a) `esp_task_wdt_isr_user_handler()` (weak hook in IDF 4.4.7 `libesp_system.a`; disassembly shows it is called after the task-name prints and before `abort()`) routes GPIO26 back from LEDC to the GPIO register and clears GPIO26/27. ROM function + register writes only, IRAM. It fires for every watched task (control task; core-0 idle task). (b) `partitions_nocoredump.csv` = Arduino `default.csv` without the 64 KB coredump partition (sdkconfig has `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`), so a panic does not write flash before rebooting; other offsets unchanged, the NVS survives the re-flash. Not covered by the hook: the **interrupt watchdog** (300 ms, interrupts disabled for too long) and other panics go straight to the panic handler (backtrace over UART, ~tens of ms, then reboot), with outputs held until the reset. | CONFIRMED (user, review M2) |
 | A28 | m2: when the valve LEDC pin is detached, the channel is parked at 0 % duty, so a later re-attach starts OPEN (`ledcAttachPin` re-applies the channel's current duty for up to one 100 ms period). m3: `esp_reset_reason()` is printed at boot (with a warning after a watchdog, panic or brownout reset, because the RAM trip latch is lost) and sent in every sample as `reset_reason`. m5: `monitor_dtr = 0` / `monitor_rts = 0`, so opening the PlatformIO monitor does not reset the board (**verified on the real DevKit 2026-11-15**: opening the monitor did not reset it; other serial programs may still toggle DTR/RTS). m6: `analogSetAttenuation(ADC_11db)` sets the global attenuation that `analogReadMilliVolts` characterizes with, as well as the per-pin one. m9: commands carry an id; a reply that arrives after the 1 s timeout is printed as `LATE` and still processed (a late `ZERO` is still saved); all reply text, including `STATUS`, is formatted by the serial task, so the control task no longer formats floats; `STATUS` adds V_gpio, zero_ok, idle time and the stack high-water marks (control, net, serial). | CONFIRMED (user) |

@@ -81,11 +81,12 @@ constexpr float REREF_MAX_SPREAD = 0.5f;   // max - min of those samples [mbar]
 // TEST included), the RAW pin voltage must leave the open-circuit band within 30 s,
 // otherwise SENSOR_LOSS. Raw mV, so it does not depend on the zero offset: a 0 V
 // input reads ~75-150 mV at 11 dB (ADC floor), i.e. ~1-2 mbar(g) before the offset.
-// PROVISIONAL: TO BE SET FROM THE BENCH OPEN-CIRCUIT MEASUREMENT (README 3.3):
-// measured max + margin, and at most ~300 mV (the slowest 10 mbar/min ramp from
-// 0 mbar(g) must cross it well inside 30 s: 5 mbar(g) = 333 mV with the /5 module;
-// 300 mV = 4.5 mbar(g), crossed at 27 s). 0 V reads ~1.1-2.3 mbar(g) with the module.
-constexpr float OPEN_CIRCUIT_MV_THRESHOLD = 250.0f;  // mV at GPIO34
+// MEASURED (bench open-circuit test, README 3.3, reported by the team 2026-11-16; A25): 0 V at the sensor
+// input reads a steady 142.0 mV at GPIO34, max noise 147.7 mV. Threshold = 180 mV
+// (32 mV margin above the max). Rule kept: at most ~300 mV, so the slowest 10 mbar/min
+// ramp from 0 mbar(g) crosses it well inside 30 s. Healthy readings on the rig: vented
+// ~142 mV (= the 2.13 mbar zero offset), pump-ON plateau with the vent closed ~350 mV.
+constexpr float OPEN_CIRCUIT_MV_THRESHOLD = 180.0f;  // mV at GPIO34, measured
 constexpr uint32_t PLAUS_TIMEOUT_MS = 30000;         // 30 s
 
 // Light filter so P_f cannot mask a rapid rise (Section 4.3.1.2 Eq. 11, alpha >= 0.5).
