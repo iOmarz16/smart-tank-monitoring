@@ -81,3 +81,5 @@ if the operator runs with FI-101 closed (no inflow) — expected behaviour.
 - A13 (`ZERO` offset limit ±3 mbar) — confirm.
 - A18 — a spare input pin for the t3 output read-back in I3a, if you want it in firmware.
 - C1 — pump-off at 20 vs 29, waiting for CHE (`PUMP_OFF_AT_SOFT_LIMIT`).
+- I1 / I6b (Table I) assume an LED toggled at t0 and a vent LED for the 240 fps video. No LED output exists
+  in Figure 12; the DevKit onboard LED (GPIO2) would be a new pin. Not implemented without approval.
