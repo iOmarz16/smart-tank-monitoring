@@ -9,7 +9,8 @@
 // ---------------------------------------------------------------------------
 // Pins (Figure 12)
 // ---------------------------------------------------------------------------
-// PT-101 signal via 33k/10k divider + 100 nF. GPIO34 is ADC1: works with Wi-Fi on.
+// PT-101 signal via the "Voltage Sensor" module (divide by 5, no 100 nF): as built,
+// overrides Figure 12 (team update 2026-11-15, A29). GPIO34 is ADC1: works with Wi-Fi on.
 constexpr int PIN_PT101 = 34;
 // PCV-101 vent solenoid, normally open, MOSFET 1 TRIG. HIGH = energized = valve CLOSED.
 constexpr int PIN_VALVE = 26;
@@ -40,9 +41,13 @@ constexpr uint32_t READBACK_TIMEOUT_MS = 1000;  // no edge within 1 s of the tri
 // ---------------------------------------------------------------------------
 // PT-101 scaling (Section 5.1, Siemens QBM2030-30, range jumper on 3000 Pa)
 // ---------------------------------------------------------------------------
-constexpr float DIVIDER_RATIO = 4.3f;     // (33k + 10k) / 10k
-constexpr float SENSOR_MBAR_PER_V = 3.0f; // 0-10 V = 0-30 mbar(g)
-constexpr int ADC_AVERAGE_READS = 8;      // analogReadMilliVolts reads averaged per loop
+// As built (A29): "Voltage Sensor" module, V_sensor = V_gpio x 5. Pin max 10 V / 5 = 2.0 V.
+// P_mbar = mV x 5 x 3.0 / 1000 = mV x 0.015, minus zero_offset.
+constexpr float SENSOR_DIVIDER_RATIO = 5.0f;
+constexpr float SENSOR_MBAR_PER_V = 3.0f;  // 0-10 V = 0-30 mbar(g)
+// analogReadMilliVolts reads averaged per loop. No 100 nF on the module, so more
+// averaging. Read time is measured every loop and shown in STATUS (adc_us).
+constexpr int ADC_AVERAGE_READS = 32;
 
 // ---------------------------------------------------------------------------
 // Timing (Specification 5)
@@ -77,8 +82,9 @@ constexpr float REREF_MAX_SPREAD = 0.5f;   // max - min of those samples [mbar]
 // otherwise SENSOR_LOSS. Raw mV, so it does not depend on the zero offset: a 0 V
 // input reads ~75-150 mV at 11 dB (ADC floor), i.e. ~1-2 mbar(g) before the offset.
 // PROVISIONAL: TO BE SET FROM THE BENCH OPEN-CIRCUIT MEASUREMENT (README 3.3):
-// measured max + margin, and at most ~350 mV (the slowest 10 mbar/min ramp from
-// 0 mbar(g) must cross it well inside 30 s: 5 mbar(g) = 388 mV).
+// measured max + margin, and at most ~300 mV (the slowest 10 mbar/min ramp from
+// 0 mbar(g) must cross it well inside 30 s: 5 mbar(g) = 333 mV with the /5 module;
+// 300 mV = 4.5 mbar(g), crossed at 27 s). 0 V reads ~1.1-2.3 mbar(g) with the module.
 constexpr float OPEN_CIRCUIT_MV_THRESHOLD = 250.0f;  // mV at GPIO34
 constexpr uint32_t PLAUS_TIMEOUT_MS = 30000;         // 30 s
 
@@ -90,12 +96,9 @@ constexpr float PF_ALPHA = 0.5f;
 // ---------------------------------------------------------------------------
 constexpr float P_SOFT_LIMIT = 20.0f;  // software safety limit
 constexpr float P_HARD_LIMIT = 29.0f;  // hard trip (Table D layer 4)
-// DISCREPANCY, pending CHE confirmation:
-//   Specification 6 says injection stops AND the vent opens at the 20 mbar(g) limit.
-//   Table D layer 3 (20 mbar) only opens the vent; pump OFF is layer 4 (29 mbar).
-// true  -> follow Spec 6: pump OFF at 20 mbar(g).
-// false -> follow Table D: at 20 only the vent opens; pump stops at 29, on sensor loss,
-//          or on any later escalation.
+// Spec 6 vs Table D layer 3: RESOLVED, CHE confirmed pump OFF at 20 mbar(g) (2026-11-15).
+// true  -> Spec 6: pump OFF at 20 mbar(g) (confirmed; keep true).
+// false -> Table D: at 20 only the vent opens; pump stops at 29 or on sensor loss.
 constexpr bool PUMP_OFF_AT_SOFT_LIMIT = true;
 // Optional lag compensation for the ~1 s QBM2030 reaction (Section 5.2.2, I6b fallback):
 // soft trip on max(P, P + LAG_COMP_S * dP/dt). Off by default.
@@ -104,6 +107,16 @@ constexpr float LAG_COMP_S = 1.0f;
 // Trip reset (Section 4.3.1.2 / Fig. 7 rule 7): P < 20, valid non-stale sample,
 // deliberate local operator action (serial RESET). Strict "<".
 constexpr float RESET_MAX_PRESSURE = 20.0f;
+// SOFT_LIMIT auto-clear (team decision 2026-11-15, A30; like HYSYS T3 "re-close at <= 10").
+// A SOFT_LIMIT trip that started in RUN clears by itself when P_raw <= SOFT_AUTOCLEAR_P
+// with a valid, non-stale sample, and RUN resumes with a bumpless PI restart. After
+// SOFT_AUTOCLEAR_MAX auto-clears within SOFT_AUTOCLEAR_WINDOW_S, the next SOFT_LIMIT
+// trip latches (RESET needed). Trips that started in TEST, SENSOR_LOSS and HARD_LIMIT
+// always latch. A sensor loss or a rejected drop during a SOFT_LIMIT trip turns it into
+// a latched SENSOR_LOSS; P >= 29 turns it into a latched HARD_LIMIT.
+constexpr float SOFT_AUTOCLEAR_P = 10.0f;          // mbar(g), "<="
+constexpr int SOFT_AUTOCLEAR_MAX = 3;
+constexpr uint32_t SOFT_AUTOCLEAR_WINDOW_S = 300;  // 5 min
 
 // ---------------------------------------------------------------------------
 // PI control (Integrated Spec 2, HYSYS gains, Section 5.1)

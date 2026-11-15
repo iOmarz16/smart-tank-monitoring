@@ -134,6 +134,7 @@ def i5(rows, tol=1.0) -> bool:
     for r in rows:
         seq, state = int(r["seq"]), r["state"]
         contiguous = prev_seq is not None and seq == prev_seq + 1
+        prev_was = prev_state
         restart = state == "RUN" and not (contiguous and prev_state == "RUN")
         prev_seq, prev_state = seq, state
         if state != "RUN":
@@ -143,10 +144,12 @@ def i5(rows, tol=1.0) -> bool:
         if restart:
             seg += 1
             prev_li = None
-            if contiguous:
+            if contiguous and prev_was != "TRIPPED":
                 integ = 0.0          # START from IDLE: firmware resets the integrator
             else:
-                integ = li           # log gap: resume the recursion from the logged value
+                # log gap, or SOFT_LIMIT auto-clear (TRIPPED -> RUN, A30): the firmware
+                # initialises the integrator for a bumpless restart; resume from the log.
+                integ = li
                 continue
         pf = num(r["P_f"])
         if not flag(r["valid"]) or pf is None:

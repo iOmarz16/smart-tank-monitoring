@@ -21,7 +21,8 @@ size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n) {
       "\"loop_period_us\":%lu,\"replayed\":%s,\"slope\":%s,\"v_gpio_mv\":%s,"
       "\"sensor_fault\":%s,\"zero_offset\":%s,\"zero_forced\":%s,\"trip_decision_us\":%llu,"
       "\"trip_output_us\":%llu,\"t3_us\":%llu,\"t3_source\":\"%s\",\"led_on\":%s,"
-      "\"rb_valve_off\":%s,\"rb_pump_off\":%s,\"reset_reason\":\"%s\"}",
+      "\"rb_valve_off\":%s,\"rb_pump_off\":%s,\"reset_reason\":\"%s\",\"trip_latched\":%s,"
+      "\"auto_clears\":%u}",
       (unsigned long)s.seq, (unsigned long)s.t_esp_ms, f(a, 16, s.p_raw, 4), f(b, 16, s.p_f, 4),
       tf(s.valid), f(c, 16, s.u_open, 4), f(d, 16, s.integ, 5), f(e, 16, s.valve_duty, 4),
       tf(s.pump_on), tf(s.warning), f(g, 16, s.t_to_limit, 2), stateName(s.state), tf(s.trip),
@@ -29,7 +30,8 @@ size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n) {
       f(h, 16, s.slope, 4), f(i, 16, s.v_gpio_mv, 1), tf(s.sensor_fault), f(j, 16, s.zero_offset, 4),
       tf(s.zero_forced), (unsigned long long)s.trip_decision_us,
       (unsigned long long)s.trip_output_us, (unsigned long long)s.t3_us, t3SourceName(s.t3_source),
-      tf(s.led_on), tf(s.rb_valve_off), tf(s.rb_pump_off), resetReasonName(s.reset_reason));
+      tf(s.led_on), tf(s.rb_valve_off), tf(s.rb_pump_off), resetReasonName(s.reset_reason),
+      tf(s.trip_latched), (unsigned)s.auto_clears);
   if (len < 0 || (size_t)len >= n) return 0;
   return (size_t)len;
 }

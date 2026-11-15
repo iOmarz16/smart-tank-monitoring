@@ -13,7 +13,8 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
  "t_to_limit":null,"state":"RUN","trip":false,"trip_reason":"NONE","loop_period_us":100004,
  "replayed":false,"slope":0.0021,"v_gpio_mv":775.3,"sensor_fault":false,"zero_offset":0.1500,
  "zero_forced":false,"trip_decision_us":0,"trip_output_us":0,"t3_us":0,"t3_source":"NONE",
- "led_on":false,"rb_valve_off":false,"rb_pump_off":false,"reset_reason":"POWERON"}
+ "led_on":false,"rb_valve_off":false,"rb_pump_off":false,"reset_reason":"POWERON",
+ "trip_latched":false,"auto_clears":0}
 ```
 
 | Field | Meaning |
@@ -39,7 +40,9 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
 | `led_on` | GPIO2 LED level written in this loop (`LED MODE SAMPLE`: toggles each sample; `VENT`: vent commanded fully open) |
 | `rb_valve_off`, `rb_pump_off` | read-back levels (true = MOSFET OFF); always false when read-back is disabled |
 | `reset_reason` | why the ESP32 last booted (`esp_reset_reason()`), the same in every sample since boot: `POWERON` · `EXT` · `SW` · `PANIC` · `INT_WDT` · `TASK_WDT` · `WDT` · `DEEPSLEEP` · `BROWNOUT` · `SDIO` · `UNKNOWN`. After a watchdog, panic or brownout reset, any latched trip was lost |
-| `v_gpio_mv` | raw averaged pin voltage at GPIO34, mV, before any zero offset. The open-circuit check compares it with `OPEN_CIRCUIT_MV_THRESHOLD` |
+| `v_gpio_mv` | raw averaged pin voltage at GPIO34 (mean of 32 reads), mV, before any zero offset. `P_raw = v_gpio_mv × 0.015 − zero_offset` (÷5 module, A29). The open-circuit check compares it with `OPEN_CIRCUIT_MV_THRESHOLD` |
+| `trip_latched` | `true` while TRIPPED and only a serial `RESET` can clear the trip. `false` in a SOFT_LIMIT trip that will auto-clear at `P_raw` ≤ 10 (A30), and whenever not tripped |
+| `auto_clears` | SOFT_LIMIT auto-clears in the last 300 s (0–3). An auto-clear shows as `state` TRIPPED → RUN |
 
 ### Pong
 `{"type":"pong","t_pc":<echoed>,"t_esp":<ESP32 ms, 3 decimals>}`

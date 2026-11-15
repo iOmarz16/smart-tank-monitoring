@@ -26,6 +26,11 @@ extern bool g_boot_zero_forced;
 // true: a valid, non-forced zero exists in NVS (START is refused otherwise, review C1)
 extern bool g_boot_zero_ok;
 
+// Duration of the ADC_AVERAGE_READS sensor reads: last loop and max since boot, us
+// (written by the control task, shown in STATUS).
+extern volatile uint32_t g_adc_read_us;
+extern volatile uint32_t g_adc_read_us_max;
+
 // esp_reset_reason() read in setup() (review m3), and its name.
 extern uint8_t g_reset_reason;
 const char *resetReasonName(uint8_t r);

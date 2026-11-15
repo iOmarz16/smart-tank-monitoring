@@ -8,6 +8,8 @@
 static_assert(SLOPE_WINDOW <= 8, "window arrays hold 8 samples");
 static_assert(ZERO_AVERAGE_SAMPLES <= 16, "zero history holds 16 samples");
 static_assert(ZERO_FORCE_MAX_ABS_OFFSET >= ZERO_MAX_ABS_OFFSET, "FORCE cap below the normal limit");
+static_assert(SOFT_AUTOCLEAR_MAX >= 1 && SOFT_AUTOCLEAR_MAX <= 8, "auto-clear history holds 8 entries");
+static_assert(SOFT_AUTOCLEAR_P < P_SOFT_LIMIT, "auto-clear needs hysteresis below the soft limit");
 
 const char *stateName(State s) {
   switch (s) {
@@ -72,6 +74,7 @@ bool Supervisor::stale(uint64_t now_us) const {
 // ---------------------------------------------------------------------------
 void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
   valid_ = false;
+  drop_rejected_ = false;
   read_ok_ = read_ok;
   v_gpio_mv_ = v_gpio_mv;
   // ZERO window: consecutive valid IDLE samples only. Any invalid sample restarts it
@@ -86,7 +89,8 @@ void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
     reref_count_ = 0;
     return;
   }
-  const float p_uncorr = (v_gpio_mv / 1000.0f) * DIVIDER_RATIO * SENSOR_MBAR_PER_V;
+  // As built (A29): P = mV x 5 x 3 / 1000 = mV x 0.015, minus the zero offset.
+  const float p_uncorr = (v_gpio_mv / 1000.0f) * SENSOR_DIVIDER_RATIO * SENSOR_MBAR_PER_V;
   const float p = p_uncorr - zero_offset_;
   p_raw_ = p;
 
@@ -101,6 +105,7 @@ void Supervisor::validate(uint64_t now_us, float v_gpio_mv, bool read_ok) {
   if (has_ref_ && (last_valid_p_ - p) > P_MAX_DROP_PER_SAMPLE) {
     // Physically impossible drop: a broken wire reads 0 V (inside the range).
     ok = false;
+    drop_rejected_ = true;
     // New-reference rule (Q5): REREF_SAMPLES consecutive in-range samples that
     // agree within REREF_MAX_SPREAD. Only accepted while the trip is latched.
     if (reref_count_ == 0) {
@@ -279,6 +284,7 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       } else {
         setState(State::RUN, now_us);
         integ_ = 0.0f;
+        pi_restart_ = false;
         plaus_low_since_us_ = 0;
         r->code = ReplyCode::OK_RUN;
       }
@@ -307,7 +313,11 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
         setState(State::IDLE, now_us);
         reason_ = TripReason::NONE;
         pump_allowed_in_trip_ = false;
+        trip_latched_ = false;
         trip_decision_us_ = trip_output_us_ = 0;
+        // A30: a deliberate RESET starts a fresh auto-clear count (START is still needed).
+        memset(auto_clear_us_, 0, sizeof(auto_clear_us_));
+        auto_clear_i_ = 0;
         r->code = ReplyCode::OK_RESET;
       }
       return;
@@ -327,6 +337,8 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
       s.warning = warning_;
       s.zero_forced = zero_forced_;
       s.zero_ok = zero_ok_;
+      s.trip_latched = state_ == State::TRIPPED && trip_latched_;
+      s.auto_clears = (uint8_t)autoClearsInWindow(now_us);
       s.idle_s = state_ == State::IDLE ? (uint32_t)((now_us - idle_since_us_) / 1000000ULL) : 0;
       s.trip_decision_us = trip_decision_us_;
       s.trip_output_us = trip_output_us_;
@@ -390,15 +402,50 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *r) {
 // ---------------------------------------------------------------------------
 // 3. Trip (Spec 6, IS3, Table D). Evaluated every loop, every state, BEFORE PI.
 // ---------------------------------------------------------------------------
+int Supervisor::autoClearsInWindow(uint64_t now_us) const {
+  int n = 0;
+  for (int i = 0; i < SOFT_AUTOCLEAR_MAX; i++) {
+    const uint64_t t = auto_clear_us_[i];
+    if (t != 0 && now_us - t <= (uint64_t)SOFT_AUTOCLEAR_WINDOW_S * 1000000ULL) n++;
+  }
+  return n;
+}
+
 void Supervisor::enterTrip(TripReason r) {
   const bool pump_was_on = pump_on_;
-  setState(State::TRIPPED, clock_());
+  const State from = state_;
+  const uint64_t now = clock_();
+  setState(State::TRIPPED, now);
   reason_ = r;
   trip_new_ = true;
-  trip_decision_us_ = clock_();
+  trip_decision_us_ = now;
   trip_output_us_ = 0;
-  // Spec 6 vs Table D discrepancy: see PUMP_OFF_AT_SOFT_LIMIT in config.h.
+  // Spec 6 vs Table D: see PUMP_OFF_AT_SOFT_LIMIT in config.h (CHE: pump OFF at 20).
   pump_allowed_in_trip_ = !PUMP_OFF_AT_SOFT_LIMIT && r == TripReason::SOFT_LIMIT && pump_was_on;
+  // A30: only a SOFT_LIMIT trip from RUN, with fewer than SOFT_AUTOCLEAR_MAX auto-clears
+  // in the window, may clear by itself. Everything else needs RESET.
+  trip_latched_ = !(r == TripReason::SOFT_LIMIT && from == State::RUN &&
+                    autoClearsInWindow(now) < SOFT_AUTOCLEAR_MAX);
+}
+
+// A30: SOFT_LIMIT auto-clear back to RUN with a bumpless PI restart. The vent is fully
+// open in TRIPPED (u_open = 100). The integrator is initialised so that this step's PI
+// output (computeOutputs, same step, no integration on this sample) is exactly u_open,
+// then the normal PI recursion takes over from the next sample.
+void Supervisor::autoClear(uint64_t now_us) {
+  auto_clear_us_[auto_clear_i_] = now_us;
+  auto_clear_i_ = (auto_clear_i_ + 1) % SOFT_AUTOCLEAR_MAX;
+  setState(State::RUN, now_us);
+  reason_ = TripReason::NONE;
+  pump_allowed_in_trip_ = false;
+  trip_latched_ = false;
+  trip_decision_us_ = trip_output_us_ = 0;
+  plaus_low_since_us_ = 0;
+  const float e = p_f_ - SETPOINT;
+  // u = KC * (e + (TS/TI) * integ) = u_open_  ->  integ = (u_open_/KC - e) * TI/TS
+  integ_ = (u_open_ / KC - e) * (TI_S / TS_S);
+  pi_restart_ = true;
+  auto_clear_new_ = true;
 }
 
 void Supervisor::evaluateTrip(uint64_t now_us) {
@@ -436,10 +483,19 @@ void Supervisor::evaluateTrip(uint64_t now_us) {
 
   if (state_ != State::TRIPPED) {
     if (r != TripReason::NONE) enterTrip(r);
-  } else if (pump_allowed_in_trip_ && (hard || loss)) {
-    // Only reachable with PUMP_OFF_AT_SOFT_LIMIT == false: escalate, pump OFF.
+    return;
+  }
+  if (reason_ == TripReason::SOFT_LIMIT && (hard || loss || drop_rejected_)) {
+    // Escalate (A30): a SOFT_LIMIT trip never auto-clears after P >= 29, a stale
+    // sensor, or a rejected drop (a broken wire, even if later re-referenced).
     pump_allowed_in_trip_ = false;
+    trip_latched_ = true;
     reason_ = hard ? TripReason::HARD_LIMIT : TripReason::SENSOR_LOSS;
+    return;
+  }
+  if (reason_ == TripReason::SOFT_LIMIT && !trip_latched_ && r == TripReason::NONE && valid_ &&
+      !stale(now_us) && zero_ok_ && p_raw_ <= SOFT_AUTOCLEAR_P) {
+    autoClear(now_us);
   }
 }
 
@@ -474,11 +530,15 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
       o.pump_on = true;
       if (valid_) {
         const float e = p_f_ - SETPOINT;
-        float s = integ_ + e;
-        const float u_cand = KC * (e + (TS_S / TI_S) * s);
-        // Conditional integration: no accumulation while saturated in the direction of e.
-        if ((u_cand > 100.0f && e > 0.0f) || (u_cand < 0.0f && e < 0.0f)) s = integ_;
-        integ_ = s;
+        if (pi_restart_) {
+          pi_restart_ = false;  // A30 bumpless restart: integ_ already set for this e
+        } else {
+          float s = integ_ + e;
+          const float u_cand = KC * (e + (TS_S / TI_S) * s);
+          // Conditional integration: no accumulation while saturated in the direction of e.
+          if ((u_cand > 100.0f && e > 0.0f) || (u_cand < 0.0f && e < 0.0f)) s = integ_;
+          integ_ = s;
+        }
         u_open_ = clampf(KC * (e + (TS_S / TI_S) * integ_), 0.0f, 100.0f);
       }
       // else: sensor fault (< 0.5 s): integrator frozen, last duty held (Fig. 7, A4).
@@ -495,6 +555,7 @@ Outputs Supervisor::computeOutputs(uint64_t now_us) {
 Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const Command *cmd,
                          Reply *reply, bool *replied) {
   trip_new_ = false;
+  auto_clear_new_ = false;
   if (replied) *replied = false;
 
   validate(now_us, v_gpio_mv, read_ok);
@@ -530,5 +591,8 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   s.warning = warning_;
   s.trip = state_ == State::TRIPPED;
   s.test_pump_timeout = test_pump_timeout_;
+  s.trip_latched = state_ == State::TRIPPED && trip_latched_;
+  s.auto_clears = (uint8_t)autoClearsInWindow(now_us);
+  s.auto_clear_event = auto_clear_new_;
   return o;
 }

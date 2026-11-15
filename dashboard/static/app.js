@@ -62,7 +62,10 @@ function render() {
     box.className = "status s-trip";
     $("status-main").textContent = "TRIP";
     $("status-ar").textContent = "فصل أمان";
-    $("status-sub").textContent = `${s.trip_reason} · reset only at the rig (serial RESET)`;
+    // A30: a SOFT_LIMIT trip from RUN may clear by itself; the dashboard never resets anything.
+    $("status-sub").textContent = s.trip_latched
+      ? `${s.trip_reason} · LATCHED · reset only at the rig (serial RESET)`
+      : `${s.trip_reason} · auto-clears at P ≤ 10 mbar(g) (${s.auto_clears ?? 0}/3 in 5 min)`;
   } else if (s.warning) {
     box.className = "status s-warning";
     $("status-main").textContent = "WARNING";

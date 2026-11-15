@@ -4,7 +4,8 @@
 // Order inside step() (Section 4.3.1.2, Algorithm 1):
 //   1. convert + validate the reading, update P_f, slope and warning (display only)
 //   2. execute at most one operator command (serial only)
-//   3. evaluate the trip (every state, BEFORE PI); a trip latches
+//   3. evaluate the trip (every state, BEFORE PI); a trip latches, except a SOFT_LIMIT
+//      trip from RUN, which may auto-clear at P <= SOFT_AUTOCLEAR_P (A30)
 //   4. compute outputs for the current state (PI only in RUN)
 #pragma once
 
@@ -45,6 +46,8 @@ class Supervisor {
   void evaluateTrip(uint64_t now_us);
   Outputs computeOutputs(uint64_t now_us);
   void enterTrip(TripReason r);
+  void autoClear(uint64_t now_us);
+  int autoClearsInWindow(uint64_t now_us) const;
   bool stale(uint64_t now_us) const;
   // Every state change goes through here: it restarts the IDLE dwell timer and
   // clears the ZERO window, so ZERO only ever averages samples taken in IDLE.
@@ -56,6 +59,11 @@ class Supervisor {
   TripReason reason_ = TripReason::NONE;
   bool pump_allowed_in_trip_ = false;  // only when PUMP_OFF_AT_SOFT_LIMIT == false
   bool trip_new_ = false;
+  bool trip_latched_ = false;   // only RESET clears the trip (A30)
+  bool auto_clear_new_ = false; // a SOFT_LIMIT trip auto-cleared in this step
+  // Times of the last SOFT_AUTOCLEAR_MAX auto-clears (0 = unused), ring.
+  uint64_t auto_clear_us_[8] = {0};
+  int auto_clear_i_ = 0;
   uint64_t trip_decision_us_ = 0;
   uint64_t trip_output_us_ = 0;
 
@@ -75,6 +83,7 @@ class Supervisor {
   float reref_min_ = 0.0f, reref_max_ = 0.0f;
   uint64_t plaus_low_since_us_ = 0;
   bool plaus_fail_ = false;
+  bool drop_rejected_ = false;  // this sample failed the drop check (even if re-referenced)
 
   // ZERO averaging: last uncorrected pressures from valid IDLE samples
   float zero_hist_[16] = {0};
@@ -96,6 +105,7 @@ class Supervisor {
 
   // PI
   float integ_ = 0.0f;
+  bool pi_restart_ = false;  // A30: next RUN output uses integ_ as set, without integrating
   float u_open_ = 100.0f;
   float valve_duty_ = 0.0f;
   bool pump_on_ = false;

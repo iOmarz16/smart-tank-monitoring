@@ -22,8 +22,8 @@ All pressures are gauge, in **mbar(g)**. This is NOT a water-level project.
 |---|---|
 | Controller | ESP32 30-pin DevKit, CH340 USB |
 | PT-101 | Siemens QBM2030-30, 0–10 V = 0–30 mbar(g) (range jumper on 3000 Pa), 24 V supply |
-| Sensor input | 33 kΩ / 10 kΩ divider + 100 nF → **GPIO34** (ADC1). Max 2.33 V at pin |
-| Scaling | `V_sensor = V_gpio × 4.3`; `P_raw = V_sensor × 3.0 − zero_offset` |
+| Sensor input | As built (team update 2026-11-15, overrides Fig. 12): "Voltage Sensor" module ÷5, no 100 nF → **GPIO34** (ADC1). Max 2.0 V at pin |
+| Scaling | `SENSOR_DIVIDER_RATIO = 5.0`; `P_raw = analogReadMilliVolts × 0.015 − zero_offset` |
 | PCV-101 | 12 V solenoid, **normally open**, MOSFET 1, TRIG **GPIO26**. HIGH = energized = CLOSED |
 | P-101 | 5 V pump, MOSFET 2, TRIG **GPIO27**. HIGH = pump ON |
 | Fail-safe | 10 kΩ pull-downs on both TRIG lines → reset/power loss = pump OFF, valve OPEN |
@@ -33,7 +33,9 @@ All pressures are gauge, in **mbar(g)**. This is NOT a water-level project.
 - Loop 100 ms (FreeRTOS, core 1, vTaskDelayUntil); networking on core 0, never blocks control.
 - Setpoint 10, warning 14, soft limit 20, hard trip 29 mbar(g). Sensor timeout 0.5 s.
 - PI: Kc = 36 %/mbar, Ti = 8 s, Ts = 0.1 s; `u_open` = vent opening %, closed duty = 100 − u_open.
-- Trip is evaluated every loop BEFORE PI, in every state, and latches. Reset only via serial `RESET`.
+- Trip is evaluated every loop BEFORE PI, in every state. SENSOR_LOSS, HARD_LIMIT and any trip
+  from TEST latch; reset only via serial `RESET`. A SOFT_LIMIT trip from RUN auto-clears at
+  P ≤ 10 mbar(g) (bumpless PI restart), at most 3 times in 5 min, then latches (assumptions A30).
 - Valve PWM ≤ 10 Hz (LEDC). On trip, outputs go LOW in the same loop (not at the next PWM edge).
 
 ## Layout

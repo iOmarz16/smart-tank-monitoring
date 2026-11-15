@@ -42,6 +42,7 @@ SAMPLE_FIELDS = [
     "warning", "t_to_limit", "state", "trip", "trip_reason", "loop_period_us", "replayed",
     "slope", "v_gpio_mv", "sensor_fault", "zero_offset", "zero_forced", "trip_decision_us",
     "trip_output_us", "t3_us", "t3_source", "led_on", "rb_valve_off", "rb_pump_off", "reset_reason",
+    "trip_latched", "auto_clears",
 ]
 CSV_FIELDS = SAMPLE_FIELDS + ["t_arrival_pc_ms", "t_arrival_wall", "clock_offset_ms", "latency_ms"]
 

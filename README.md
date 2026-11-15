@@ -8,9 +8,9 @@ Decisions and assumptions: [`docs/assumptions.md`](docs/assumptions.md). Wire pr
 |---|---|---|
 | PI control | 10 mbar(g) | firmware, RUN only (Kc 36, Ti 8 s, PWM 10 Hz on PCV-101) |
 | Early warning | 14 mbar(g) or predicted 20 within 12 s | firmware flag, shown on the dashboard |
-| Software limit (trip) | 20 mbar(g) | firmware: pump OFF + vent OPEN, **latched** |
-| Hard trip | 29 mbar(g) | firmware |
-| Sensor loss | no valid sample > 0.5 s, or V_gpio < `OPEN_CIRCUIT_MV_THRESHOLD` for 30 s while the pump is ON (any state, TEST too) | firmware |
+| Software limit (trip) | 20 mbar(g) | firmware: pump OFF (CHE-confirmed) + vent OPEN. A trip that started in **RUN** auto-clears at ≤ 10 mbar(g) and RUN resumes; after 3 auto-clears within 5 min the next one **latches**. A trip that started in TEST always latches |
+| Hard trip | 29 mbar(g) | firmware, **latched** |
+| Sensor loss | no valid sample > 0.5 s, or V_gpio < `OPEN_CIRCUIT_MV_THRESHOLD` for 30 s while the pump is ON (any state, TEST too) | firmware, **latched** |
 | Fail-safe hardware | power loss / reset / watchdog | 10 kΩ pull-downs → pump OFF, valve OPEN; the task watchdog also drives both LOW before its reboot |
 | Inherent limit | 440 mbar | pump deadhead (vessel safe). PT-101 overload is 100 mbar (sensor at risk) |
 
@@ -19,6 +19,11 @@ safety valve was removed (Table C, §5.1.1). Nothing above the software trips ve
 itself; operation is attended at all times.
 
 The dashboard is **view and log only**. It cannot start, stop or reset anything.
+
+**As built, PT-101 input** (overrides Figure 12): a "Voltage Sensor" module that divides by 5
+(no 33k/10k, no 100 nF) feeds GPIO34. `P_raw = V_gpio[mV] × 0.015 − zero_offset`
+(`SENSOR_DIVIDER_RATIO = 5.0`); 0–10 V from the sensor is 0–2.0 V at the pin. Each sample averages
+32 ADC reads (`ADC_AVERAGE_READS`); `STATUS` shows how long they take (`adc_us`, `adc_us_max`).
 
 ```
 firmware/        PlatformIO project (ESP32, Arduino core 2.0.17); constants in include/config.h
@@ -89,7 +94,7 @@ Serial commands (type and press Enter):
 | `STATUS` | any | one-line state, pressure, V_gpio, PI, zero (`zero_ok`), IDLE time, trip timestamps; then free heap and free stack per task |
 | `START` | IDLE, sensor valid, **valid ZERO saved** | RUN: pump ON, PI active. Refused after a first flash, after `ZERO FORCE`, or if the zero could not be saved |
 | `STOP` | RUN, TEST | IDLE: pump OFF, valve OPEN |
-| `RESET` | TRIPPED | back to IDLE, only if P < 20 mbar(g) and the sensor is valid |
+| `RESET` | TRIPPED | back to IDLE, only if P < 20 mbar(g) and the sensor is valid. Needed for every latched trip. On a SOFT_LIMIT trip that would auto-clear, `RESET` goes to IDLE instead (the pump stays OFF) and starts a fresh auto-clear count |
 | `ZERO` | IDLE ≥ 60 s | stores the mean of the last 1 s of IDLE samples as the zero offset (NVS). Refused if the window is not steady (max − min > 0.3 mbar) or the offset is > ±3 mbar |
 | `ZERO FORCE` | IDLE ≥ 60 s | same, but accepts an offset beyond ±3 mbar, **up to ±5 mbar** (absolute cap). Prints a `WARN` line; `zero_forced=true` is then logged in every sample (and shown on the dashboard) until a normal `ZERO`. **`START` stays refused** with a forced zero |
 | `LED MODE SAMPLE` | any | GPIO2 LED toggles at t0 of every sample (I1 video) |
@@ -101,7 +106,19 @@ Serial commands (type and press Enter):
 | `TEST EXIT` | TEST | back to IDLE |
 
 In TEST mode the console prints `P_raw`, `P_f`, `V_gpio`, the pump state and the valve state at 5 Hz.
-State changes are printed as `EVENT state=... trip_reason=...`.
+State changes are printed as `EVENT state=... trip_reason=...`; a trip line says either
+`LATCHED (RESET required)` or `auto-clears at P_raw <= 10.0`. Every auto-clear is logged as
+`EVENT AUTO-CLEAR SOFT_LIMIT -> RUN (bumpless PI restart) ... auto_clears=n/3`, and every sample
+carries `trip_latched` and `auto_clears` (CSV and dashboard).
+
+**SOFT_LIMIT auto-clear** (team decision, `docs/assumptions.md` A30). Only for a SOFT_LIMIT trip
+that started in RUN: once P_raw ≤ 10.0 mbar(g) with a valid, non-stale sample, the rig returns to
+RUN by itself. The pump restarts and the PI starts bumpless, from the fully open vent. Up to 3
+auto-clears are allowed within 5 min; the next SOFT_LIMIT trip in that window latches. The
+trip also latches, with its reason changed, if during it the pressure reaches 29
+(`HARD_LIMIT`), the sensor goes stale, or a reading drops by more than 2 mbar in one sample
+(`SENSOR_LOSS`, e.g. a wire break). To keep the pump from restarting, type `RESET` while
+P < 20: the rig goes to IDLE.
 
 While the pump is ON, in any state, the open-circuit check is armed: if V_gpio stays below
 `OPEN_CIRCUIT_MV_THRESHOLD` for 30 s, the rig trips `SENSOR_LOSS`. This also happens with a
@@ -119,9 +136,9 @@ Follow Figure 12 and assembly step 6 of §5.1.1. Lid open or HV-101 open, so the
 
 1. **Without the ESP32** (Fig. 12 note 8): adapter 24 V at the switch; Buck 1 = 5.0 V, Buck 2 = 12.0 V
    measured with a multimeter **before** anything is connected to them. Touch each TRIG to 3.3 V:
-   the valve clicks, the pump runs. The divider midpoint reads ≈ 0 V.
-2. Check the QBM2030-30 range selector is on **3000 Pa** (0–30 mbar). Its OUT goes to the divider only,
-   never straight to the ESP32.
+   the valve clicks, the pump runs. The voltage-sensor module output reads ≈ 0 V.
+2. Check the QBM2030-30 range selector is on **3000 Pa** (0–30 mbar). Its OUT goes to the ÷5 module
+   input only, never straight to the ESP32 (10 V would destroy GPIO34).
 3. Flash the ESP32 over USB **before** wiring it into the box. Open the monitor; you should see
    `M021 controller boot`, `reset_reason=...`, a `zero_offset=0.000 mbar  START refused until a
    valid ZERO is saved` line (first flash: nothing in NVS yet), then `EVENT state=IDLE`.
@@ -131,7 +148,8 @@ Follow Figure 12 and assembly step 6 of §5.1.1. Lid open or HV-101 open, so the
    - `TEST DUTY 50`: steady 10 Hz clicking. `TEST DUTY 0`.
    - `TEST PUMP ON`: pump runs. `TEST PUMP OFF` within a few seconds (the vessel is open, so a
      pump left ON trips `SENSOR_LOSS` after 30 s by the open-circuit check; `RESET` if it does).
-   - Watch `V_gpio`: ≈ 0 mV at ambient pressure, never above ≈ 2330 mV.
+   - Watch `V_gpio`: ≈ 0 mV at ambient pressure (the ADC floor reads ~75–150 mV), never above
+     ≈ 2000 mV (10 V / 5; the 29 mbar(g) hard trip is at 1933 mV).
    - `TEST EXIT`.
 6. Close the lid and HV-101. `TEST`, `TEST VALVE ENERGIZE`, `TEST PUMP ON`, and watch `P_raw` rise.
    Stop well below 14 (`TEST PUMP OFF`, `TEST VALVE RELEASE`). The pressure must fall back.
@@ -145,9 +163,11 @@ then `OK zero ... saved to NVS`; only then is `START` allowed. The offset surviv
 the 60 s zero-flow check.
 
 Why it is required: a 0 V input reads about 75–150 mV on the ESP32 ADC (its floor), i.e.
-+1–2 mbar(g). The zero removes that floor. A zero taken while the vessel still holds pressure would
-shift **every** limit up by the same amount, so `ZERO` is refused unless the last 1 s of IDLE
-samples is steady (max − min ≤ 0.3 mbar).
++1.1–2.3 mbar(g) with the ÷5 module. The zero removes that floor. A zero taken while the vessel
+still holds pressure would shift **every** limit up by the same amount, so `ZERO` is refused unless
+the last 1 s of IDLE samples is steady (max − min ≤ 0.3 mbar, i.e. 20 mV at the pin). The module
+has no 100 nF filter. If `ZERO` keeps failing on the spread with a vented vessel, the reading is
+too noisy: report the spread to the team, and do not raise `ZERO_MAX_SPREAD` on your own.
 
 If `ZERO` is refused (offset beyond ±3 mbar), first check that the vessel really is vented and that
 the range selector is on 3000 Pa. Use `ZERO FORCE` only once you know why the offset is large; it
@@ -209,18 +229,24 @@ open-circuit reading of your board once, before any pressurized run:
    `v_gpio_mv` and `P_raw`, is logged to the CSV; Wi-Fi active, since radio noise is part of the
    reading.
 2. `TEST` (pump OFF, valve released).
-3. Unplug the PT-101 **OUT** wire at the divider input. Leave the divider and the 100 nF connected to
-   GPIO34: the 10 kΩ bottom resistor is what pulls the pin to 0 V, exactly as in a real wire break.
+3. Unplug the PT-101 **OUT** wire at the ÷5 module input. Leave the module connected to GPIO34:
+   its bottom resistor is what pulls the pin to 0 V, exactly as in a real break of the sensor wire.
 4. Record V_gpio and P_raw for 60 s (5 Hz `TEST ...` lines and the CSV). The state may change to
    `TRIPPED` / `SENSOR_LOSS` (if P_raw falls below −2 mbar(g), or through the drop check). That is
    expected; `v_gpio_mv` is still logged in every sample, so keep recording (use `STATUS` for spot
    values once the TEST lines stop).
 5. Plug the wire back in. `RESET` if tripped (needs a valid sample), `TEST EXIT` otherwise.
-6. Threshold = **measured max V_gpio + margin** (team decision, e.g. 50–100 mV). It must stay
-   **≤ about 350 mV**: a healthy rig on the slowest ramp (10 mbar/min from 0) must cross it well
-   inside the 30 s window (5 mbar(g) = 388 mV at the pin). If max + margin is above that, stop and
-   discuss before flashing.
-7. Set `OPEN_CIRCUIT_MV_THRESHOLD`, rebuild, flash, and record the measured values and the chosen
+6. **Second case: module-to-ESP32 wire.** Repeat steps 2–5, this time unplugging the wire from the
+   module output to **GPIO34**. GPIO34 has no internal pull resistor, so the pin then **floats**
+   and can read anything, including a plausible pressure that no check catches. Record what it
+   reads. If it does not stay below the threshold, stop and report it: a pull-down from GPIO34 to
+   GND fixes it (1 MΩ shifts the reading by only ~0.6 %), but it is a hardware change for the team
+   to decide.
+7. Threshold = **measured max V_gpio (step 4) + margin** (team decision, e.g. 50 mV). It must stay
+   **≤ about 300 mV**: a healthy rig on the slowest ramp (10 mbar/min from 0) must cross it well
+   inside the 30 s window (with the ÷5 module, 5 mbar(g) = 333 mV at the pin; 300 mV is crossed
+   at 27 s). If max + margin is above that, stop and discuss before flashing.
+8. Set `OPEN_CIRCUIT_MV_THRESHOLD`, rebuild, flash, and record the measured values and the chosen
    threshold in `docs/assumptions.md` (A25).
 
 ---
@@ -247,7 +273,7 @@ sample at the moment it arrives. Film it together with the LED for the I1 cross-
 
 ### Without hardware
 ```bat
-run_fake_rig.bat --scenario normal          :: or ramp | sensor_loss | wifi_outage | open_circuit
+run_fake_rig.bat --scenario normal          :: or ramp | ramp_repeat | sensor_loss | wifi_outage | open_circuit
 run_dashboard.bat --rig ws://127.0.0.1:8765/
 ```
 `fake_rig.py` runs a Python port of the firmware logic (constants read from `config.h`) on a
@@ -258,10 +284,13 @@ which needs 60 s in IDLE). `--no-autostart` stays in IDLE; `--zero-error 3.6` si
 sensor offset to try `ZERO FORCE`; `--adc-floor-mv 120` models the ESP32 ADC floor.
 `--scenario open_circuit --adc-floor-mv 120` shows the wire-broken-at-start case: the reading
 looks vented while the true pressure rises, until the open-circuit check trips after 30 s.
+`ramp` trips SOFT_LIMIT in RUN and auto-clears back to RUN at 10; `ramp_repeat` blocks the vent
+again after every auto-clear: three auto-clears, then the fourth trip latches.
 It is a test tool, not a validated model.
 `python tools/check_rules.py` (e.g. `dashboard\.venv\Scripts\python tools\check_rules.py`) runs the
-regression checks of the review rules (START gate, ZERO rules, open-circuit trip). They test the
-simulator's copy of the logic in `fake_rig.py`, **not the C++ firmware**. Its own Python loop can stretch a few loop periods while
+regression checks of the safety rules (START gate, ZERO rules, open-circuit trip, ÷5 scaling,
+SOFT_LIMIT auto-clear and latching). They test the simulator's copy of the logic in `fake_rig.py`,
+**not the C++ firmware**. The fake rig's own Python loop can stretch a few loop periods while
 it replays after a reconnect, so `analyze_log.py` may report I2 FAIL on fake-rig logs; that says
 nothing about the ESP32.
 
@@ -278,9 +307,9 @@ if the dashboard was closed during a test, reconnect within 150 s to recover the
 
 **Vent-closed ramp (used by P5, I3a, I6a).** In RUN the PI vents, so the vent-closed ramp of T3/P5 is
 run in TEST mode: `TEST`, `TEST VALVE ENERGIZE`, `TEST PUMP ON`, FI-101 set to 148 std cm³/min. The
-trip at 20 mbar(g) is still enforced in TEST and latches. **The trip does not re-close the vent
-automatically** (HYSYS T3 does; the firmware latches, by decision Q1). After the vent has brought P
-below 20 mbar(g), type `RESET` on the serial console to return to IDLE.
+trip at 20 mbar(g) is still enforced in TEST. **A trip that started in TEST always latches** (team
+decision, A30): nothing restarts the pump after a manual test. After the vent has brought P below
+20 mbar(g), type `RESET` on the serial console to return to IDLE.
 The TEST pump turns OFF after the requested time (`TEST PUMP ON` = 60 s): at 148 std cm³/min
 (≈ 28 mbar/min) the trip comes after about 42 s, inside the default. For slower ramps give a
 duration: P2 at 10 mbar/min needs ~120 s to 20 mbar(g), so use `TEST PUMP ON 180` (max 300).
@@ -297,15 +326,30 @@ duration: P2 at 10 mbar/min needs ~120 s to 20 mbar(g), so use `TEST PUMP ON 180
 | **I6a** IS1 | 30 mbar/min vent-closed ramp: warning on the dashboard vs the PT-101 crossing of 20 mbar(g). | warning ≥ 10 s before 20 mbar(g) | extras: `warning lead at the dashboard` |
 | **I6b** IS3 | `LED MODE VENT` (default). Vent-closed ramp; film the water U-tube (204 mm H₂O = 20 mbar(g)) and the GPIO2 LED, which lights when the vent is commanded open, at 240 fps. | vent open ≤ 1.0 s after the true crossing | video. If it fails, set `LAG_COMP_ENABLED = true` (after approval) |
 
-**P5** (Table G): vent-closed ramp as above, warning at 14, vent open at 20, peak ≤ 22 and never > 29.
-Then `RESET` once P < 20, `START` again, and unplug the supply at 15 mbar(g): the valve must vent.
+**P5** (Table G):
+1. Vent-closed ramp in TEST as above: warning at 14, vent open at 20, peak ≤ 22 and never > 29. The
+   EVENT line must say `LATCHED (RESET required)` (a TEST trip). Wait until P is below 20, then `RESET`.
+2. `START`, and unplug the supply at 15 mbar(g): the valve must vent.
+3. Auto-clear (A30): this needs a SOFT_LIMIT trip **in RUN**, and in RUN the PI with the open vent
+   (≈ 250 std cm³/min at 10 mbar(g)) out-vents the pump, so the rig does not normally get there.
+   Do not block or restrict the vent to force it until the team has agreed on a method. Until
+   then, the auto-clear and its limit of 3 per 5 min are covered by `tools/check_rules.py` and the
+   fake-rig `ramp` / `ramp_repeat` scenarios, which test the Python port only.
+   If a RUN trip does happen on the rig, check the CSV: `trip_latched=false` during the trip,
+   then `EVENT AUTO-CLEAR` at P_raw ≤ 10.0, `u_open` = 100 on the clear sample, then falling smoothly.
 
 ---
 
 ## 6. Open items
 
-- **O3** `PUMP_OFF_AT_SOFT_LIMIT = true` (Spec 6) vs Table D (pump off only at 29): kept until CHE confirms.
-- `OPEN_CIRCUIT_MV_THRESHOLD` is provisional until the bench measurement of section 3.3.
+- ~~O3~~ resolved: CHE confirmed pump OFF at 20 mbar(g) (`PUMP_OFF_AT_SOFT_LIMIT = true`).
+- `OPEN_CIRCUIT_MV_THRESHOLD` is provisional until the bench measurement of section 3.3 (now ≤ ~300 mV).
+- **GPIO34 floats** if the module-to-ESP32 wire breaks (no pull-down on the as-built input): the
+  reading is then undefined and may look plausible. Measure it in 3.3 step 6; a pull-down from GPIO34
+  to GND is the fix, and that is a team decision.
+- ADC read time for 32 reads: measure it at bring-up with `STATUS` (`adc_us`, `adc_us_max`).
+- Reading noise without the 100 nF: check the `ZERO` spread (≤ 0.3 mbar) on the real rig.
+- P5 step 3: no agreed way yet to trip in RUN on the rig (see P5).
 - **P1 is blocked pending CHE**: it holds 25 mbar(g), above the 20 mbar(g) trip that is enforced in
   every state, and there is no passive relief. The firmware has no mode that raises or bypasses the
   limit; CHE is asked to run the leak test below 20 mbar(g) (`docs/assumptions.md`, E).

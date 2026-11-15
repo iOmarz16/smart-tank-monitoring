@@ -10,8 +10,11 @@ Usage (from the repo root):
 
 Scenarios:
     normal       START after 2 s, hold 10 mbar(g) at 98.7 std cm3/min
-    ramp         vent blocked (P5-style), 148 std cm3/min: warning at 14, trip at 20;
-                 the block is released when the trip fires so the vent can act
+    ramp         vent blocked (P5-style) in RUN, 148 std cm3/min: warning at 14, trip at 20;
+                 the block is released when the trip fires so the vent can act, and the
+                 SOFT_LIMIT trip auto-clears back to RUN at 10 mbar(g) (A30)
+    ramp_repeat  as ramp, but the vent is blocked again after every auto-clear: three
+                 auto-clears, then the fourth SOFT_LIMIT trip within 5 min latches
     sensor_loss  hold at 10; PT-101 wire breaks at 60 s (reads 0 V), restored at 90 s
     wifi_outage  hold at 10; every client dropped and refused from 60 s for 60 s
     open_circuit PT-101 wire broken from boot (review C1): START is accepted (the
@@ -19,7 +22,7 @@ Scenarios:
                  SENSOR_LOSS 30 s later. Try it with --adc-floor-mv 120
 
 Console (stdin) commands, like the USB serial port: ZERO [FORCE] START STOP RESET STATUS,
-LED MODE SAMPLE|VENT. TEST mode is not simulated.
+LED MODE SAMPLE|VENT. TEST mode is not simulated (a trip from TEST always latches).
 The simulated NVS holds a valid zero of 0.000 mbar at start (START allowed); use
 --fresh-nvs to start like a first flash (START refused until ZERO).
 This is a test tool: it is NOT a verified model of the rig.
@@ -94,6 +97,11 @@ class Supervisor:
     v_mv: float = 0.0
     pump_allowed_in_trip: bool = False
     trip_new: bool = False
+    trip_latched: bool = False
+    auto_clear_new: bool = False
+    auto_clear_us: list = field(default_factory=list)  # times of recent auto-clears
+    drop_rejected: bool = False
+    pi_restart: bool = False
     trip_decision_us: int = 0
     trip_output_us: int = 0
     valid: bool = False
@@ -137,6 +145,7 @@ class Supervisor:
 
     def validate(self, now_us: int, v_mv: float, read_ok: bool) -> None:
         self.valid = False
+        self.drop_rejected = False
         self.read_ok, self.v_mv = read_ok, v_mv
         # ZERO window: consecutive valid IDLE samples only.
         kept = list(self.zero_hist)
@@ -145,7 +154,7 @@ class Supervisor:
             self.p_raw = NAN
             self.reref_count = 0
             return
-        p_uncorr = (v_mv / 1000.0) * C["DIVIDER_RATIO"] * C["SENSOR_MBAR_PER_V"]
+        p_uncorr = (v_mv / 1000.0) * C["SENSOR_DIVIDER_RATIO"] * C["SENSOR_MBAR_PER_V"]
         p = p_uncorr - self.zero_offset
         self.p_raw = p
         if p < C["P_VALID_MIN"]:
@@ -154,6 +163,7 @@ class Supervisor:
         ok = True
         if self.has_ref and (self.last_valid_p - p) > C["P_MAX_DROP_PER_SAMPLE"]:
             ok = False
+            self.drop_rejected = True
             if self.reref_count == 0:
                 self.reref_min = self.reref_max = p
                 self.reref_count = 1
@@ -246,13 +256,14 @@ class Supervisor:
                 return f"ERR START refused: {why}"
             self.set_state("RUN", now_us)
             self.integ, self.plaus_low_since_us = 0.0, 0
+            self.pi_restart = False
             return "OK RUN"
         if cmd == "STOP":
             if self.state in ("RUN", "TEST"):
                 self.set_state("IDLE", now_us)
                 return "OK IDLE"
             if self.state == "TRIPPED":
-                return f"ERR trip latched ({self.reason}): use RESET"
+                return f"ERR tripped ({self.reason}): STOP does not apply; RESET returns to IDLE"
             return f"OK already {self.state}"
         if cmd == "RESET":
             if self.state != "TRIPPED":
@@ -264,20 +275,44 @@ class Supervisor:
             self.set_state("IDLE", now_us)
             self.reason = "NONE"
             self.pump_allowed_in_trip = False
+            self.trip_latched = False
             self.trip_decision_us = self.trip_output_us = 0
+            self.auto_clear_us.clear()
             return "OK RESET -> IDLE"
         if cmd == "STATUS":
             return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} "
                     f"P_f={self.p_f:.3f} V_gpio={self.v_mv:.1f}mV u_open={self.u_open:.1f} "
-                    f"integ={self.integ:.3f} zero={self.zero_offset:.3f} zero_ok={int(self.zero_ok)}")
+                    f"integ={self.integ:.3f} zero={self.zero_offset:.3f} zero_ok={int(self.zero_ok)} "
+                    f"latched={int(self.state == 'TRIPPED' and self.trip_latched)} "
+                    f"auto_clears={self.auto_clears_in_window(now_us)}/{C['SOFT_AUTOCLEAR_MAX']}")
         return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS LED MODE)"
 
+    def auto_clears_in_window(self, now_us: int) -> int:
+        w = C["SOFT_AUTOCLEAR_WINDOW_S"] * 1_000_000
+        return sum(1 for t in self.auto_clear_us[-C["SOFT_AUTOCLEAR_MAX"]:] if now_us - t <= w)
+
     def enter_trip(self, r: str, clock_us: int) -> None:
-        was_on = self.pump_on
+        was_on, came_from = self.pump_on, self.state
         self.set_state("TRIPPED", clock_us)
         self.reason, self.trip_new = r, True
         self.trip_decision_us, self.trip_output_us = clock_us, 0
         self.pump_allowed_in_trip = (not C["PUMP_OFF_AT_SOFT_LIMIT"]) and r == "SOFT_LIMIT" and was_on
+        # A30: only a SOFT_LIMIT trip from RUN, with quota left, may auto-clear.
+        self.trip_latched = not (r == "SOFT_LIMIT" and came_from == "RUN"
+                                 and self.auto_clears_in_window(clock_us) < C["SOFT_AUTOCLEAR_MAX"])
+
+    def auto_clear(self, now_us: int) -> None:
+        # Bumpless: this step's PI update gives exactly u_open (= 100 in TRIPPED).
+        self.auto_clear_us = (self.auto_clear_us + [now_us])[-C["SOFT_AUTOCLEAR_MAX"]:]
+        self.set_state("RUN", now_us)
+        self.reason = "NONE"
+        self.pump_allowed_in_trip = self.trip_latched = False
+        self.trip_decision_us = self.trip_output_us = 0
+        self.plaus_low_since_us = 0
+        e = self.p_f - C["SETPOINT"]
+        self.integ = (self.u_open / C["KC"] - e) * (C["TI_S"] / C["TS_S"])
+        self.pi_restart = True
+        self.auto_clear_new = True
 
     def evaluate_trip(self, now_us: int, clock_us: int) -> None:
         # Open-circuit check: raw pin mV, armed whenever the pump is commanded ON (any state).
@@ -303,9 +338,15 @@ class Supervisor:
         if self.state != "TRIPPED":
             if r != "NONE":
                 self.enter_trip(r, clock_us)
-        elif self.pump_allowed_in_trip and (hard or loss):
+            return
+        if self.reason == "SOFT_LIMIT" and (hard or loss or self.drop_rejected):
             self.pump_allowed_in_trip = False
+            self.trip_latched = True
             self.reason = "HARD_LIMIT" if hard else "SENSOR_LOSS"
+            return
+        if (self.reason == "SOFT_LIMIT" and not self.trip_latched and r == "NONE" and self.valid
+                and not self.stale(now_us) and self.zero_ok and self.p_raw <= C["SOFT_AUTOCLEAR_P"]):
+            self.auto_clear(now_us)
 
     def compute_outputs(self) -> tuple[bool, float]:
         pump, duty = False, 0.0
@@ -318,12 +359,15 @@ class Supervisor:
             pump = True
             if self.valid:
                 e = self.p_f - C["SETPOINT"]
-                s = self.integ + e
                 k = C["TS_S"] / C["TI_S"]
-                u_cand = C["KC"] * (e + k * s)
-                if (u_cand > 100 and e > 0) or (u_cand < 0 and e < 0):
-                    s = self.integ
-                self.integ = s
+                if self.pi_restart:
+                    self.pi_restart = False  # A30 bumpless restart: integ already set
+                else:
+                    s = self.integ + e
+                    u_cand = C["KC"] * (e + k * s)
+                    if (u_cand > 100 and e > 0) or (u_cand < 0 and e < 0):
+                        s = self.integ
+                    self.integ = s
                 self.u_open = min(100.0, max(0.0, C["KC"] * (e + k * self.integ)))
             duty = 100.0 - self.u_open
         self.pump_on = pump
@@ -332,6 +376,7 @@ class Supervisor:
 
     def step(self, now_us: int, v_mv: float, read_ok: bool, cmd: str | None, clock_us: int):
         self.trip_new = False
+        self.auto_clear_new = False
         self.validate(now_us, v_mv, read_ok)
         if self.state == "BOOT" and self.valid:
             self.set_state("IDLE", now_us)
@@ -369,8 +414,9 @@ class Plant:
         if self.wire_broken:
             return self.adc_floor_mv
         p = self.p_sensor + zero_true + random.gauss(0.0, self.noise)
-        v = max(0.0, p) / C["SENSOR_MBAR_PER_V"] / C["DIVIDER_RATIO"] * 1000.0
-        return min(max(v, self.adc_floor_mv), 3100.0)  # ADC floor / ceiling at 11 dB
+        v_sensor = min(max(0.0, p) / C["SENSOR_MBAR_PER_V"], 10.0)  # QBM2030 output 0-10 V
+        v = v_sensor / C["SENSOR_DIVIDER_RATIO"] * 1000.0            # /5 module: <= 2.0 V
+        return max(v, self.adc_floor_mv)  # ADC floor at 11 dB
 
 
 # ---------------------------------------------------------------------------
@@ -407,13 +453,15 @@ class Rig:
         sc = self.args.scenario
         if t >= 2.0 and not getattr(self, "_started", False):
             self._started = True
-            if sc == "ramp":
+            if sc in ("ramp", "ramp_repeat"):
                 self.plant.inflow = 148.0
                 self.plant.vent_blocked = True
             if not self.args.no_autostart:
                 self.cmd_queue.append("START")
-        if sc == "ramp" and self.plant.vent_blocked and self.sup.state == "TRIPPED":
+        if sc in ("ramp", "ramp_repeat") and self.plant.vent_blocked and self.sup.state == "TRIPPED":
             self.plant.vent_blocked = False
+        if sc == "ramp_repeat" and self.sup.auto_clear_new:
+            self.plant.vent_blocked = True
         if sc == "sensor_loss":
             self.plant.wire_broken = 60.0 <= t < 90.0
         if sc == "open_circuit":
@@ -492,7 +540,16 @@ class Rig:
                 "rb_valve_off": bool(C["READBACK_ENABLED"]) and s.valve_duty <= 0.0,
                 "rb_pump_off": bool(C["READBACK_ENABLED"]) and not s.pump_on,
                 "reset_reason": "POWERON",
+                "trip_latched": s.state == "TRIPPED" and s.trip_latched,
+                "auto_clears": s.auto_clears_in_window(now_us),
             }
+            if s.auto_clear_new:
+                print(f"[fake_rig] EVENT AUTO-CLEAR SOFT_LIMIT -> RUN P_raw={s.p_raw:.3f} "
+                      f"auto_clears={sample['auto_clears']}/{C['SOFT_AUTOCLEAR_MAX']}", flush=True)
+            if self.sup.trip_new:
+                print(f"[fake_rig] EVENT TRIPPED {s.reason} "
+                      f"{'LATCHED (RESET required)' if s.trip_latched else 'auto-clears at P <= 10'}",
+                      flush=True)
             prev_us = now_us
             self.ring.append(sample)
             self.seq += 1
@@ -618,7 +675,8 @@ class Rig:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenario", choices=["normal", "ramp", "sensor_loss", "wifi_outage", "open_circuit"],
+    ap.add_argument("--scenario", choices=["normal", "ramp", "ramp_repeat", "sensor_loss", "wifi_outage",
+                                           "open_circuit"],
                     default="normal")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)

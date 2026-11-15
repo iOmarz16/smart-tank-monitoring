@@ -156,7 +156,8 @@ static void formatReply(const Reply &r, char *out, size_t n) {
       snprintf(out, n, "OK IDLE (pump OFF, valve OPEN)");
       return;
     case ReplyCode::ERR_STOP_TRIPPED:
-      snprintf(out, n, "ERR trip latched (%s): use RESET", tripReasonName(r.reason));
+      snprintf(out, n, "ERR tripped (%s): STOP does not apply; RESET returns to IDLE",
+               tripReasonName(r.reason));
       return;
     case ReplyCode::OK_ALREADY:
       snprintf(out, n, "OK already %s", st);
@@ -178,13 +179,15 @@ static void formatReply(const Reply &r, char *out, size_t n) {
       const StatusSnapshot &s = r.status;
       snprintf(out, n,
                "state=%s trip=%s P_raw=%.3f P_f=%.3f V_gpio=%.1fmV valid=%d u_open=%.1f integ=%.3f "
-               "pump=%d duty=%.1f warning=%d zero=%.3f%s zero_ok=%d idle_s=%lu trip_dec_us=%llu "
-               "trip_out_us=%llu",
+               "pump=%d duty=%.1f warning=%d zero=%.3f%s zero_ok=%d idle_s=%lu latched=%d "
+               "auto_clears=%u/%d trip_dec_us=%llu trip_out_us=%llu adc_us=%lu adc_us_max=%lu",
                stateName(s.state), tripReasonName(s.reason), (double)s.p_raw, (double)s.p_f,
                (double)s.v_gpio_mv, s.valid ? 1 : 0, (double)s.u_open, (double)s.integ,
                s.pump_on ? 1 : 0, (double)s.duty, s.warning ? 1 : 0, (double)s.zero_offset,
                s.zero_forced ? "(FORCED)" : "", s.zero_ok ? 1 : 0, (unsigned long)s.idle_s,
-               (unsigned long long)s.trip_decision_us, (unsigned long long)s.trip_output_us);
+               s.trip_latched ? 1 : 0, (unsigned)s.auto_clears, SOFT_AUTOCLEAR_MAX,
+               (unsigned long long)s.trip_decision_us, (unsigned long long)s.trip_output_us,
+               (unsigned long)g_adc_read_us, (unsigned long)g_adc_read_us_max);
       return;
     }
     case ReplyCode::ERR_TEST_STATE:
@@ -318,6 +321,7 @@ void serialTask(void *) {
   State last_state = State::BOOT;
   TripReason last_reason = TripReason::NONE;
   bool last_pump_timeout = false;
+  bool last_latched = false;
   printHelp();
 
   for (;;) {
@@ -340,12 +344,28 @@ void serialTask(void *) {
     Sample s;
     if (ring::latest(&s)) {
       // Asynchronous state-change reports (trips in particular).
-      if (s.state != last_state || s.trip_reason != last_reason) {
-        Serial.printf("EVENT state=%s trip_reason=%s P_raw=%.3f V_gpio=%.1fmV seq=%lu\n",
-                      stateName(s.state), tripReasonName(s.trip_reason), (double)s.p_raw,
-                      (double)s.v_gpio_mv, (unsigned long)s.seq);
+      // A30: TRIPPED -> RUN only happens through a SOFT_LIMIT auto-clear (RESET goes to
+      // IDLE), so this transition is the auto-clear log line, even if a sample was missed.
+      if (last_state == State::TRIPPED && s.state == State::RUN) {
+        Serial.printf("EVENT AUTO-CLEAR SOFT_LIMIT -> RUN (bumpless PI restart) P_raw=%.3f "
+                      "auto_clears=%u/%d in %lu s seq=%lu\n",
+                      (double)s.p_raw, (unsigned)s.auto_clears, SOFT_AUTOCLEAR_MAX,
+                      (unsigned long)SOFT_AUTOCLEAR_WINDOW_S, (unsigned long)s.seq);
+      }
+      if (s.state != last_state || s.trip_reason != last_reason || s.trip_latched != last_latched) {
+        char how[80] = "";
+        if (s.state == State::TRIPPED) {
+          if (s.trip_latched) snprintf(how, sizeof(how), " LATCHED (RESET required)");
+          else snprintf(how, sizeof(how), " auto-clears at P_raw <= %.1f (RESET -> IDLE instead)",
+                        (double)SOFT_AUTOCLEAR_P);
+        }
+        Serial.printf("EVENT state=%s trip_reason=%s%s P_raw=%.3f V_gpio=%.1fmV auto_clears=%u/%d seq=%lu\n",
+                      stateName(s.state), tripReasonName(s.trip_reason), how, (double)s.p_raw,
+                      (double)s.v_gpio_mv, (unsigned)s.auto_clears, SOFT_AUTOCLEAR_MAX,
+                      (unsigned long)s.seq);
         last_state = s.state;
         last_reason = s.trip_reason;
+        last_latched = s.trip_latched;
       }
       if (s.test_pump_timeout && !last_pump_timeout) {
         Serial.printf("EVENT TEST pump OFF: requested duration reached seq=%lu\n",

@@ -14,9 +14,17 @@
 
 static uint64_t clockUs() { return (uint64_t)esp_timer_get_time(); }
 
+// ADC_AVERAGE_READS reads; the duration is measured every loop for STATUS (adc_us).
+volatile uint32_t g_adc_read_us = 0;
+volatile uint32_t g_adc_read_us_max = 0;
+
 static float readSensorMv(bool *ok) {
+  const uint32_t t0 = micros();
   uint32_t sum = 0;
   for (int i = 0; i < ADC_AVERAGE_READS; i++) sum += analogReadMilliVolts(PIN_PT101);
+  const uint32_t dt = micros() - t0;
+  g_adc_read_us = dt;
+  if (dt > g_adc_read_us_max) g_adc_read_us_max = dt;
   *ok = true;  // analogReadMilliVolts has no failure return on ESP32
   return (float)sum / (float)ADC_AVERAGE_READS;
 }

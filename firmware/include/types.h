@@ -44,6 +44,9 @@ struct Sample {
   bool rb_pump_off;   // read-back: pump MOSFET OFF (only if READBACK_ENABLED)
   uint8_t reset_reason;    // esp_reset_reason() at boot (same value in every sample)
   bool test_pump_timeout;  // internal (not in the JSON): TEST pump switched OFF at the end of its duration
+  bool trip_latched;       // tripped and only RESET can clear it (A30); false while a SOFT_LIMIT trip may auto-clear
+  uint8_t auto_clears;     // SOFT_LIMIT auto-clears within the last SOFT_AUTOCLEAR_WINDOW_S
+  bool auto_clear_event;   // internal (not in the JSON): a SOFT_LIMIT trip auto-cleared in this step
 };
 
 // Commands from the serial task to the control task. Only the control task
@@ -108,7 +111,8 @@ struct StatusSnapshot {
   State state;
   TripReason reason;
   float p_raw, p_f, v_gpio_mv, u_open, integ, duty, zero_offset;
-  bool valid, pump_on, warning, zero_forced, zero_ok;
+  bool valid, pump_on, warning, zero_forced, zero_ok, trip_latched;
+  uint8_t auto_clears;
   uint32_t idle_s;  // s in IDLE (0 outside IDLE)
   uint64_t trip_decision_us, trip_output_us;
 };
