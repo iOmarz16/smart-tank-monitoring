@@ -2,6 +2,8 @@
 // Pushes one JSON object per sample from the ring buffer. After a (re)connect
 // the whole buffer is replayed with replayed=true; the dashboard deduplicates
 // by seq, so an outage shorter than the buffer leaves no gap (test I2).
+// Live samples are always sent first; the backlog is interleaved at
+// REPLAY_RATE_HZ, so a live sample never waits behind it (Spec 4 latency).
 // The ONLY inbound message honoured is {"type":"ping","t_pc":...}.
 // No Internet, DNS, NTP or external host (Constraint 4).
 #include <Arduino.h>
@@ -19,8 +21,12 @@ static WebSocketsServer g_ws(WS_PORT);
 
 struct ClientCursor {
   bool active;
-  uint32_t next;          // next seq to send
-  uint32_t replay_until;  // seqs <= this were buffered before the connect
+  uint32_t live_next;    // next live seq (samples produced after the connect)
+  bool replaying;        // backlog not yet fully sent
+  uint32_t replay_next;  // next backlog seq
+  uint32_t replay_end;   // last backlog seq (newest at connect time)
+  float tokens;          // replay token bucket
+  uint32_t last_us;
 };
 static ClientCursor g_clients[WEBSOCKETS_SERVER_CLIENT_MAX];
 
@@ -31,12 +37,16 @@ static void onEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       uint32_t oldest = 0, newest = 0;
       ClientCursor &c = g_clients[num];
       if (ring::range(&oldest, &newest)) {
-        c.next = oldest;
-        c.replay_until = newest;
+        c.live_next = newest + 1;
+        c.replaying = true;
+        c.replay_next = oldest;
+        c.replay_end = newest;
       } else {
-        c.next = 0;
-        c.replay_until = 0;
+        c.live_next = 0;
+        c.replaying = false;
       }
+      c.tokens = 0.0f;
+      c.last_us = micros();
       c.active = true;
       break;
     }
@@ -68,33 +78,52 @@ static void startAccessPoint() {
   esp_wifi_set_ps(WIFI_PS_NONE);  // lowest latency (Spec 4)
 }
 
+// Returns false if the sample could not be sent (client gone); true otherwise
+// (a sample missing from the ring or failing to format is skipped).
+static bool sendSample(uint8_t client, uint32_t seq, bool replayed) {
+  static char buf[768];
+  Sample s;
+  if (!ring::get(seq, &s)) return true;
+  const size_t len = formatSampleJson(s, replayed, buf, sizeof(buf));
+  if (len == 0) return true;  // cannot happen with the fixed format; skip rather than stall
+  return g_ws.sendTXT(client, buf, len);  // false -> disconnect event clears active
+}
+
 void netTask(void *) {
   startAccessPoint();
   g_ws.begin();
   g_ws.onEvent(onEvent);
 
-  static char buf[640];
   for (;;) {
     g_ws.loop();
     uint32_t oldest = 0, newest = 0;
     if (ring::range(&oldest, &newest)) {
       for (int k = 0; k < WEBSOCKETS_SERVER_CLIENT_MAX; k++) {
         ClientCursor &c = g_clients[k];
+        if (!c.active) continue;
+        // 1) live samples first, always
         int sent = 0;
-        while (c.active && c.next <= newest && sent < NET_SEND_BURST) {
-          if (c.next < oldest) c.next = oldest;  // overwritten: older than the buffer
-          Sample s;
-          if (!ring::get(c.next, &s)) break;
-          const bool replayed =
-              (c.next <= c.replay_until) || (newest - c.next >= REPLAY_LAG_SAMPLES);
-          const size_t len = formatSampleJson(s, replayed, buf, sizeof(buf));
-          if (len == 0) {
-            c.next++;  // cannot happen with the fixed format; skip rather than stall
-            continue;
-          }
-          if (!g_ws.sendTXT((uint8_t)k, buf, len)) break;  // disconnect event clears active
-          c.next++;
+        while (c.active && c.live_next <= newest && sent < NET_SEND_BURST) {
+          if (c.live_next < oldest) c.live_next = oldest;  // overwritten (should not happen)
+          const bool late = newest - c.live_next >= REPLAY_LAG_SAMPLES;
+          if (!sendSample((uint8_t)k, c.live_next, late)) break;
+          c.live_next++;
           sent++;
+        }
+        // 2) then the backlog, rate-limited (token bucket)
+        const uint32_t now = micros();
+        c.tokens += (float)(now - c.last_us) * (float)REPLAY_RATE_HZ / 1e6f;
+        if (c.tokens > 2.0f) c.tokens = 2.0f;  // small burst only
+        c.last_us = now;
+        while (c.active && c.replaying && c.tokens >= 1.0f) {
+          if (c.replay_next < oldest) c.replay_next = oldest;  // overwritten during the outage
+          if (c.replay_next > c.replay_end) {
+            c.replaying = false;
+            break;
+          }
+          if (!sendSample((uint8_t)k, c.replay_next, true)) break;
+          c.replay_next++;
+          c.tokens -= 1.0f;
         }
       }
     }

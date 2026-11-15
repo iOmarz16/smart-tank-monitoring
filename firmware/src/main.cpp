@@ -12,6 +12,7 @@
 QueueHandle_t g_cmd_queue = nullptr;
 QueueHandle_t g_reply_queue = nullptr;
 float g_boot_zero_offset = 0.0f;
+bool g_boot_zero_forced = false;
 
 static void haltSafe(const char *why) {
   outputs::valveSafe();
@@ -23,7 +24,8 @@ static void haltSafe(const char *why) {
 }
 
 void setup() {
-  // BOOT: outputs LOW before anything else (pump OFF, valve de-energized = OPEN).
+  // BOOT: outputs LOW before anything else (pump OFF, valve de-energized = OPEN,
+  // GPIO2 LED LOW).
   outputs::initSafe();
 
   Serial.begin(SERIAL_BAUD);
@@ -32,9 +34,13 @@ void setup() {
   Preferences p;
   if (p.begin("m021", true)) {
     g_boot_zero_offset = p.getFloat("zero", 0.0f);
+    g_boot_zero_forced = p.getBool("zforced", false);
     p.end();
   }
-  Serial.printf("zero_offset=%.3f mbar\n", (double)g_boot_zero_offset);
+  Serial.printf("zero_offset=%.3f mbar%s\n", (double)g_boot_zero_offset,
+                g_boot_zero_forced ? "  WARNING: set with ZERO FORCE" : "");
+  Serial.printf("readback=%s led_mode=%s\n", READBACK_ENABLED ? "ENABLED (GPIO32/33)" : "disabled",
+                LED_MODE_DEFAULT == LedMode::VENT ? "VENT" : "SAMPLE");
 
   if (!outputs::initPwm()) haltSafe("LEDC setup failed");
   if (!ring::init()) haltSafe("ring buffer allocation failed");

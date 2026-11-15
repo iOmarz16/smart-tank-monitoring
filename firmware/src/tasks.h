@@ -16,6 +16,7 @@ void serialTask(void *arg);
 
 // zero offset loaded from NVS in setup()
 extern float g_boot_zero_offset;
+extern bool g_boot_zero_forced;
 
 // Formats one sample as a single-line JSON object. Returns length, 0 on overflow.
 size_t formatSampleJson(const Sample &s, bool replayed, char *buf, size_t n);

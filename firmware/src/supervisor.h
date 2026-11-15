@@ -23,7 +23,7 @@ class Supervisor {
   typedef uint64_t (*ClockUs)();
 
   explicit Supervisor(ClockUs clock);
-  void begin(uint64_t now_us, float zero_offset);
+  void begin(uint64_t now_us, float zero_offset, bool zero_forced);
 
   // read_ok = false if the ADC read failed. cmd may be null. reply may be null;
   // if a command was executed, reply->text is filled and *replied set true.
@@ -55,6 +55,7 @@ class Supervisor {
   uint64_t trip_output_us_ = 0;
 
   float zero_offset_ = 0.0f;
+  bool zero_forced_ = false;
 
   // validity
   bool valid_ = false;

@@ -40,7 +40,8 @@ LOGS = HERE / "logs"
 SAMPLE_FIELDS = [
     "seq", "t_esp_ms", "P_raw", "P_f", "valid", "u_open", "integ", "valve_duty", "pump_on",
     "warning", "t_to_limit", "state", "trip", "trip_reason", "loop_period_us", "replayed",
-    "slope", "v_gpio_mv", "sensor_fault", "zero_offset", "trip_decision_us", "trip_output_us",
+    "slope", "v_gpio_mv", "sensor_fault", "zero_offset", "zero_forced", "trip_decision_us",
+    "trip_output_us", "t3_us", "t3_source", "led_on", "rb_valve_off", "rb_pump_off",
 ]
 CSV_FIELDS = SAMPLE_FIELDS + ["t_arrival_pc_ms", "t_arrival_wall", "clock_offset_ms", "latency_ms"]
 

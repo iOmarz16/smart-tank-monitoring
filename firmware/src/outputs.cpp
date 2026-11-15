@@ -17,11 +17,16 @@ void initSafe() {
   pinMode(PIN_VALVE, OUTPUT);
   digitalWrite(PIN_PUMP, LOW);
   digitalWrite(PIN_VALVE, LOW);
+  digitalWrite(PIN_LED, LOW);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
 }
 
 bool initPwm() { return ledcSetup(VALVE_LEDC_CHANNEL, VALVE_PWM_HZ, VALVE_PWM_BITS) != 0; }
 
 void pump(bool on) { digitalWrite(PIN_PUMP, on ? HIGH : LOW); }
+
+void led(bool on) { digitalWrite(PIN_LED, on ? HIGH : LOW); }
 
 void valveSafe() {
   if (g_attached) {

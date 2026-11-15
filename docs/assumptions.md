@@ -33,12 +33,12 @@ Status key: **OPEN** = waiting for the user · **ASSUMED** = decided, reversible
 | A10 | The ML early-warning model (§5.2.2, Table H) is out of scope for this step; firmware warning is the rule-based one. The dashboard leaves room to add it later. | §5.2.2 "Limitations and safety" | ASSUMED |
 | A11 | Lag compensation, when enabled, uses the 5-sample regression slope of P_f; it applies to the soft-limit trip only, not the hard trip. | §5.2.2 (I6b fallback, P + 1 s·dP/dt) | ASSUMED |
 | A12 | Valve PWM: 10 Hz, 14-bit LEDC (10-bit cannot reach 10 Hz from the 80 MHz APB clock; 14-bit can). | Table C (PWM ≤ 10 Hz) | ASSUMED |
-| A13 | `ZERO` is refused if the measured offset exceeds ±3.0 mbar (10 % FS, `ZERO_MAX_ABS_OFFSET`): the vessel is probably not vented, or the range jumper is wrong. New constant, not from the report. | §5.1.1 step 8 | ASSUMED — please confirm |
+| A13 | `ZERO` is refused if the measured offset exceeds ±3.0 mbar (10 % FS, `ZERO_MAX_ABS_OFFSET`): the vessel is probably not vented, or the range jumper is wrong. New constant, not from the report. | §5.1.1 step 8 | CONFIRMED. `ZERO FORCE` overrides it: prints `WARN`, persists `zforced` in NVS, `zero_forced=true` in every sample |
 | A14 | `TEST DUTY <n>` sets the **energized (closed)** duty of PCV-101, the same quantity as `valve_duty`. `TEST VALVE ENERGIZE` = 100 %, `RELEASE` = 0 %. `TEST` (no argument) enters test mode, only from IDLE. | brief §2.7 | ASSUMED |
 | A15 | Trip check also runs in BOOT and IDLE. No valid sample within 0.5 s of boot → TRIPPED / SENSOR_LOSS. | brief §2.3/§2.6, Fig. 7 | ASSUMED |
 | A16 | With `PUMP_OFF_AT_SOFT_LIMIT = false`, a soft trip keeps the pump in its previous state (ON only if it was ON). Any later hard limit or sensor loss turns it OFF and escalates `trip_reason`. | Table D layers 3–4 | ASSUMED (flag is `true` today) |
-| A17 | Replay: on every WebSocket (re)connect the whole ring buffer (1500 samples = 150 s) is re-sent with `replayed = true`; live samples sent ≥ 3 samples behind the newest are also flagged `replayed`. The dashboard deduplicates by `seq` (first copy wins). The ESP32 cannot know what the client already has, because the only inbound message is ping. | brief §3, I2 | ASSUMED |
-| A18 | Trip timestamps: `trip_decision_us` = esp_timer when the trip is decided; `trip_output_us` = esp_timer right after `valveSafe()` + pump LOW. These are software timestamps; Table I's t3 uses a spare ESP32 input reading the MOSFET outputs, which needs a wire and a pin (not implemented: no pin assigned). | §5.2.2 Fig. 16, I3 | OPEN — pin for t3 read-back? |
+| A17 | Replay: on every WebSocket (re)connect the whole ring buffer (1500 samples = 150 s) is re-sent with `replayed = true`; live samples sent ≥ 3 samples behind the newest are also flagged `replayed`. The dashboard deduplicates by `seq` (first copy wins). The ESP32 cannot know what the client already has, because the only inbound message is ping. Live samples are sent before replayed ones; the backlog is interleaved at `REPLAY_RATE_HZ` = 100 samples/s (user request). | brief §3, I2 | CONFIRMED |
+| A18 | Trip timestamps: `trip_decision_us` = esp_timer when the trip is decided; `trip_output_us` = esp_timer right after `valveSafe()` + pump LOW. These are software timestamps; Table I's t3 uses a spare ESP32 input reading the MOSFET outputs, Optional read-back added (user-approved): GPIO32 = valve `OUT−`, GPIO33 = pump `OUT−` through 36k/10k and 10k/12k dividers, `READBACK_ENABLED = false` by default. Low-side modules assumed (input HIGH = output OFF; to be confirmed with a multimeter, README 3.1). t3 = latest OFF edge of the outputs that were ON at the decision; = decision time if none was ON; `READBACK_TIMEOUT` after 1 s. | §5.2.2 Fig. 16, I3 | CONFIRMED (polarity to verify on hardware) |
 | A19 | Plausibility check uses `P_raw` of valid samples; its 30 s timer starts at the first valid sample below 1.0 mbar(g) in RUN with the pump ON and clears when a valid sample ≥ 1.0 is seen. Invalid samples neither start nor clear it. | user answer Q5 | ASSUMED |
 | A20 | Task watchdog timeout is 1 s (IDF 4.4 accepts whole seconds only). A stall shorter than 1 s is not caught by the watchdog. Core-0 idle task is also monitored (core default). | brief §2.1, Spec 6 | ASSUMED |
 
@@ -78,8 +78,13 @@ if the operator runs with FI-101 closed (no inflow) — expected behaviour.
 
 ## E. Still open
 
-- A13 (`ZERO` offset limit ±3 mbar) — confirm.
-- A18 — a spare input pin for the t3 output read-back in I3a, if you want it in firmware.
-- C1 — pump-off at 20 vs 29, waiting for CHE (`PUMP_OFF_AT_SOFT_LIMIT`).
-- I1 / I6b (Table I) assume an LED toggled at t0 and a vent LED for the 240 fps video. No LED output exists
-  in Figure 12; the DevKit onboard LED (GPIO2) would be a new pin. Not implemented without approval.
+- C1 — pump-off at 20 vs 29: `PUMP_OFF_AT_SOFT_LIMIT = true` kept until CHE confirms.
+- MOSFET module polarity (low-side) to be measured before the read-back is wired (A18).
+
+## F. Additions (answers of 2026-11-15, second round)
+
+| # | Decision / assumption | Status |
+|---|---|---|
+| A21 | GPIO2 onboard LED, serial `LED MODE SAMPLE` (toggle at t0 = loop start, before the ADC read) or `LED MODE VENT` (ON while the vent is commanded **fully** open, i.e. de-energized; OFF during PWM). Default VENT, not persisted. Driven LOW first in `setup()`; GPIO2 strapping requires LOW at reset, ensured by the DevKit LED + resistor to GND. | CONFIRMED (user); VENT definition ASSUMED |
+| A22 | Dashboard "LED sync" square mirrors `led_on` of each new live sample on arrival (not on the 100 ms render tick), so one 240 fps video gives t4 − t0 for I1. | ASSUMED |
+| A23 | 36k/10k valve divider gives ≥ 2.475 V (ESP32 V_IH) only for a valve rail ≥ 11.4 V; the full 10.2–13.2 V valve range cannot satisfy both ≤ 3.0 V and ≥ V_IH with one ratio. Valid because Buck 2 is set to 12.0 V (Fig. 12 note 2). | ASSUMED |

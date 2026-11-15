@@ -8,7 +8,7 @@ I2  loop period and logging: mean <= 100 ms, no period > 110 ms, >= 5 samples in
     1 s window, timestamps strictly increasing, no missing seq (no gap after the outage)
 I5  PI recomputation from the logged P_f (Kc 36, Ti 8 s, Ts 0.1 s): |logged - recomputed|
     duty <= 1 % at every RUN sample, output within 0..100 % without windup
-Extras: I3 trip timestamps (decision -> output write) and I6a warning lead before 20 mbar(g).
+Extras: I3 trip timing (t3 from read-back when enabled, else software) and I6a warning lead.
 Standard library only. Gains and limits are read from firmware/include/config.h.
 """
 
@@ -207,8 +207,24 @@ def extras(rows) -> None:
         print(f"  trip at seq {seq}: reason {b['trip_reason']}, P_raw {b['P_raw']}")
         if dec and out:
             print(f"    decision -> output write: {(out - dec):.0f} us (software timestamps)")
-        if t1 and out:
-            print(f"    t1 (first sample >= {lim:g}) -> output write: {out / 1000 - num(t1['t_esp_ms']):.1f} ms")
+        # t3: with read-back the edge time arrives a sample or two after the trip sample
+        t3, src = None, None
+        for r in rows:
+            if int(r["seq"]) < seq:
+                continue
+            if r["state"] != "TRIPPED":
+                break
+            src = r.get("t3_source") or None
+            if src in ("SOFTWARE", "READBACK", "READBACK_TIMEOUT"):
+                t3 = num(r.get("t3_us", ""))
+                break
+        if src is None:  # log from firmware before t3 existed
+            t3, src = out, "SOFTWARE (trip_output_us)"
+        if src == "READBACK_TIMEOUT":
+            print("    t3: READBACK_TIMEOUT - no MOSFET OFF edge within 1 s (check wiring / dividers)")
+        if t1 and t3:
+            print(f"    t3 - t1 (first sample >= {lim:g} -> outputs OFF, {src}): "
+                  f"{t3 / 1000 - num(t1['t_esp_ms']):.1f} ms   (I3a needs <= 1000 ms)")
         # I6a: first warning sample before t1 within the preceding run-up
         if t1:
             t1_ms = num(t1["t_esp_ms"])

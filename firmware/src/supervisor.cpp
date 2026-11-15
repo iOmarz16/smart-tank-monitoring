@@ -30,12 +30,23 @@ const char *tripReasonName(TripReason r) {
   return "?";
 }
 
+const char *t3SourceName(T3Source s) {
+  switch (s) {
+    case T3Source::NONE: return "NONE";
+    case T3Source::SOFTWARE: return "SOFTWARE";
+    case T3Source::READBACK: return "READBACK";
+    case T3Source::READBACK_TIMEOUT: return "READBACK_TIMEOUT";
+  }
+  return "?";
+}
+
 static float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
 Supervisor::Supervisor(ClockUs clock) : clock_(clock) {}
 
-void Supervisor::begin(uint64_t now_us, float zero_offset) {
+void Supervisor::begin(uint64_t now_us, float zero_offset, bool zero_forced) {
   zero_offset_ = zero_offset;
+  zero_forced_ = zero_forced;
   t0_us_ = now_us;
   // No valid sample yet: the 0.5 s staleness timer starts at boot.
   last_valid_us_ = now_us;
@@ -166,6 +177,7 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
   char *out = reply->text;
   const size_t n = sizeof(reply->text);
   reply->zero_changed = false;
+  reply->zero_forced = false;
   const bool sensor_ok = valid_ && !stale(now_us);
 
   switch (cmd.type) {
@@ -181,12 +193,17 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
       float sum = 0;
       for (int i = 0; i < ZERO_AVERAGE_SAMPLES; i++) sum += zero_hist_[i];
       const float z = sum / ZERO_AVERAGE_SAMPLES;
-      if (fabsf(z) > ZERO_MAX_ABS_OFFSET) {
-        snprintf(out, n, "ERR ZERO offset %.3f mbar exceeds +/-%.1f: vessel vented? sensor range jumper?",
+      const bool beyond = fabsf(z) > ZERO_MAX_ABS_OFFSET;
+      if (beyond && cmd.arg != 1) {
+        snprintf(out, n,
+                 "ERR ZERO offset %.3f mbar exceeds +/-%.1f: vessel vented? range jumper? "
+                 "(ZERO FORCE overrides)",
                  z, ZERO_MAX_ABS_OFFSET);
         return;
       }
       zero_offset_ = z;
+      zero_forced_ = beyond;
+      reply->zero_forced = beyond;
       // New zero: restart the drop reference, filter and slope window (A5).
       has_ref_ = false;
       pf_init_ = false;
@@ -195,7 +212,14 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
       zero_hist_n_ = 0;
       reply->zero_changed = true;
       reply->zero_offset = z;
-      snprintf(out, n, "OK ZERO offset=%.3f mbar (saved to NVS)", z);
+      if (beyond) {
+        snprintf(out, n,
+                 "WARN ZERO FORCE offset=%.3f mbar exceeds +/-%.1f; saved to NVS, zero_forced=1 "
+                 "is logged in every sample",
+                 z, ZERO_MAX_ABS_OFFSET);
+      } else {
+        snprintf(out, n, "OK ZERO offset=%.3f mbar (saved to NVS)", z);
+      }
       return;
     }
     case CmdType::START:
@@ -240,9 +264,10 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
     case CmdType::STATUS:
       snprintf(out, n,
                "state=%s trip=%s P_raw=%.3f P_f=%.3f valid=%d u_open=%.1f integ=%.3f pump=%d "
-               "duty=%.1f warning=%d zero=%.3f trip_dec_us=%llu trip_out_us=%llu",
+               "duty=%.1f warning=%d zero=%.3f%s trip_dec_us=%llu trip_out_us=%llu",
                stateName(state_), tripReasonName(reason_), p_raw_, p_f_, valid_ ? 1 : 0, u_open_,
                integ_, pump_on_ ? 1 : 0, valve_duty_, warning_ ? 1 : 0, zero_offset_,
+               zero_forced_ ? "(FORCED)" : "",
                (unsigned long long)trip_decision_us_, (unsigned long long)trip_output_us_);
       return;
     case CmdType::TEST_ENTER:
@@ -275,6 +300,8 @@ void Supervisor::execute(const Command &cmd, uint64_t now_us, Reply *reply) {
         snprintf(out, n, "ERR not in TEST mode");
       }
       return;
+    case CmdType::LED_MODE:
+      break;  // handled by the control task before step()
   }
   snprintf(out, n, "ERR unknown command");
 }
@@ -403,6 +430,7 @@ Outputs Supervisor::step(uint64_t now_us, float v_gpio_mv, bool read_ok, const C
   s.integ = integ_;
   s.valve_duty = valve_duty_;
   s.zero_offset = zero_offset_;
+  s.zero_forced = zero_forced_;
   s.trip_decision_us = trip_decision_us_;
   s.trip_output_us = trip_output_us_;
   s.state = state_;

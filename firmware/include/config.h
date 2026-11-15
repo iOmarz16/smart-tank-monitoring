@@ -17,6 +17,26 @@ constexpr int PIN_VALVE = 26;
 constexpr int PIN_PUMP = 27;
 // Both TRIG lines have 10 kOhm pull-downs: reset / power loss -> pump OFF, valve OPEN.
 
+// Onboard LED (DevKit, GPIO2) for the 240 fps video in I1 / I6b (user-approved).
+// GPIO2 is a strapping pin: it must be LOW/floating at reset. The DevKit LED + resistor
+// to GND keeps it LOW; never add a pull-up. Firmware drives it LOW first thing in setup().
+constexpr int PIN_LED = 2;
+enum class LedMode : uint8_t { VENT = 0, SAMPLE = 1 };
+// VENT  : LED ON while PCV-101 is commanded fully open (de-energized), for I6b.
+// SAMPLE: LED toggles at t0 (loop start) of every sample, for I1.
+constexpr LedMode LED_MODE_DEFAULT = LedMode::VENT;
+
+// Optional MOSFET output read-back for test I3a (t3). Disabled by default.
+// The modules switch LOW-SIDE: OUT+ is always at the supply, OUT- goes to ~0 V when the
+// MOSFET conducts. Read OUT- through a divider (README section 3.1), NEVER directly:
+//   valve OUT- (12 V): 36k / 10k -> 2.61 V at 12.0 V
+//   pump  OUT- (5 V) : 10k / 12k -> 2.73 V at 5.0 V
+// Logic is inverted: input HIGH = output OFF (valve de-energized/open, pump stopped).
+constexpr bool READBACK_ENABLED = false;
+constexpr int PIN_RB_VALVE = 32;
+constexpr int PIN_RB_PUMP = 33;
+constexpr uint32_t READBACK_TIMEOUT_MS = 1000;  // no edge within 1 s of the trip -> t3 not seen
+
 // ---------------------------------------------------------------------------
 // PT-101 scaling (Section 5.1, Siemens QBM2030-30, range jumper on 3000 Pa)
 // ---------------------------------------------------------------------------
@@ -117,8 +137,12 @@ constexpr uint16_t WS_PORT = 81;
 constexpr uint32_t RING_SAMPLES = 1500;
 // A sample sent more than this many samples behind the newest one is flagged replayed.
 constexpr uint32_t REPLAY_LAG_SAMPLES = 3;
-// Max samples sent per network-task iteration (keeps the task responsive).
+// Max live samples sent per network-task iteration (keeps the task responsive).
 constexpr int NET_SEND_BURST = 25;
+// Replay of the backlog after a (re)connect is interleaved and rate-limited, and live
+// samples are always sent first, so a live sample never waits behind the backlog.
+// 1500 samples drain in about 1500 / (100 - 10) = 17 s.
+constexpr uint32_t REPLAY_RATE_HZ = 100;  // replayed samples per second, per client
 
 // ---------------------------------------------------------------------------
 // Serial
@@ -127,5 +151,6 @@ constexpr uint32_t SERIAL_BAUD = 115200;
 constexpr uint32_t TEST_PRINT_PERIOD_MS = 200;  // 5 Hz in TEST mode
 constexpr int ZERO_AVERAGE_SAMPLES = 10;        // ZERO averages the last 1 s
 // ZERO is refused if the measured offset is larger than this (10 % of full scale):
-// the vessel is probably not vented, or the range jumper is wrong. (assumption A13)
+// the vessel is probably not vented, or the range jumper is wrong. (A13, user-approved)
+// "ZERO FORCE" overrides it with a warning; zero_forced is then logged in every sample.
 constexpr float ZERO_MAX_ABS_OFFSET = 3.0f;     // mbar

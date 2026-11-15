@@ -12,7 +12,8 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
  "u_open":39.4712,"integ":10.96421,"valve_duty":60.5288,"pump_on":true,"warning":false,
  "t_to_limit":null,"state":"RUN","trip":false,"trip_reason":"NONE","loop_period_us":100004,
  "replayed":false,"slope":0.0021,"v_gpio_mv":775.3,"sensor_fault":false,"zero_offset":0.1500,
- "trip_decision_us":0,"trip_output_us":0}
+ "zero_forced":false,"trip_decision_us":0,"trip_output_us":0,"t3_us":0,"t3_source":"NONE",
+ "led_on":false,"rb_valve_off":false,"rb_pump_off":false}
 ```
 
 | Field | Meaning |
@@ -33,6 +34,10 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
 | `slope` | 5-sample regression of `P_f`, mbar/s (`null` until 5 valid samples) |
 | `sensor_fault` | invalid sample but not yet stale (< 0.5 s): PI frozen, duty held |
 | `trip_decision_us`, `trip_output_us` | esp_timer µs of the trip decision and of the safe-output write (0 = none) |
+| `t3_us`, `t3_source` | I3a t3: `READBACK` = OFF edge on GPIO32/33 (read-back enabled), `SOFTWARE` = `trip_output_us`, `READBACK_TIMEOUT` = no edge within 1 s, `NONE` = not tripped. With read-back the value appears a sample or two after the trip sample |
+| `zero_forced` | the active zero offset was set with `ZERO FORCE` (beyond ±3 mbar) |
+| `led_on` | GPIO2 LED level written in this loop (`LED MODE SAMPLE`: toggles each sample; `VENT`: vent commanded fully open) |
+| `rb_valve_off`, `rb_pump_off` | read-back levels (true = MOSFET OFF); always false when read-back is disabled |
 
 ### Pong
 `{"type":"pong","t_pc":<echoed>,"t_esp":<ESP32 ms, 3 decimals>}`
@@ -44,9 +49,12 @@ The dashboard has no control authority.
 
 ## Replay
 
-On each (re)connect the whole ring buffer (1500 samples, 150 s) is sent first, flagged
-`replayed: true`. The client deduplicates by `seq` (first copy wins), so a Wi-Fi outage
-shorter than ~150 s leaves no gap in the log.
+On each (re)connect the whole ring buffer (1500 samples, 150 s) is replayed, flagged
+`replayed: true`. **Live samples are always sent first**: each pass of the network task sends every
+new live sample, then at most a token-bucket share of the backlog (`REPLAY_RATE_HZ` = 100 samples/s,
+burst ≤ 2). A live sample therefore never waits behind the backlog; a full backlog drains in ~17 s.
+Samples arrive out of `seq` order during that time. The client deduplicates by `seq` (first copy
+wins), so a Wi-Fi outage shorter than ~150 s leaves no gap in the log.
 
 ## Latency (test I1)
 

@@ -89,7 +89,8 @@ function render() {
     $("ttl").textContent = s.t_to_limit == null ? "--" : fmt(s.t_to_limit, 1);
     $("state").textContent = s.state;
     $("state").className = "val st-" + s.state;
-    $("state-sub").textContent = `seq ${s.seq} · loop ${fmt(s.loop_period_us / 1000, 1)} ms`;
+    $("state-sub").innerHTML = `seq ${s.seq} · loop ${fmt(s.loop_period_us / 1000, 1)} ms` +
+      (s.zero_forced ? ' · <span class="warn-zero">ZERO FORCED</span>' : "");
   }
 
   if (st) {
@@ -121,8 +122,16 @@ function connectBackend() {
       for (const s of m.samples) { chart.add(s); if (!latest || s.seq > latest.seq) latest = s; }
     } else if (m.type === "sample") {
       const s = m.s;
+      if (!latest || s.seq > latest.seq) {
+        latest = s;
+        // LED sync square: updated the moment a live sample arrives (t4 for the I1 video),
+        // not on the 100 ms render tick.
+        if (!s.replayed) {
+          $("sync").className = s.led_on ? "sync on" : "sync";
+          $("sync-sub").textContent = `${s.led_on ? "ON" : "OFF"} · seq ${s.seq}`;
+        }
+      }
       chart.add(s);
-      if (!latest || s.seq > latest.seq) latest = s;
     } else if (m.type === "status") {
       lastStatus = m;
       lastStatusAt = performance.now();

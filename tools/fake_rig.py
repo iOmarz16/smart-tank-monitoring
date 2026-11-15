@@ -15,7 +15,8 @@ Scenarios:
     sensor_loss  hold at 10; PT-101 wire breaks at 60 s (reads 0 V), restored at 90 s
     wifi_outage  hold at 10; every client dropped and refused from 60 s for 60 s
 
-Console (stdin) commands, like the USB serial port: ZERO START STOP RESET STATUS.
+Console (stdin) commands, like the USB serial port: ZERO [FORCE] START STOP RESET STATUS,
+LED MODE SAMPLE|VENT.
 This is a test tool: it is NOT a verified model of the rig.
 """
 
@@ -79,6 +80,7 @@ NAN = float("nan")
 @dataclass
 class Supervisor:
     zero_offset: float = 0.0
+    zero_forced: bool = False
     state: str = "BOOT"
     reason: str = "NONE"
     pump_allowed_in_trip: bool = False
@@ -183,19 +185,23 @@ class Supervisor:
 
     def execute(self, cmd: str, now_us: int) -> str:
         ok = self.valid and not self.stale(now_us)
-        if cmd == "ZERO":
+        if cmd in ("ZERO", "ZERO FORCE"):
             if self.state != "IDLE":
                 return f"ERR ZERO only in IDLE, state={self.state}"
             if not ok or len(self.zero_hist) < C["ZERO_AVERAGE_SAMPLES"]:
                 return "ERR ZERO needs valid samples"
             z = sum(self.zero_hist) / len(self.zero_hist)
-            if abs(z) > C["ZERO_MAX_ABS_OFFSET"]:
-                return f"ERR ZERO offset {z:.3f} too large"
+            beyond = abs(z) > C["ZERO_MAX_ABS_OFFSET"]
+            if beyond and cmd != "ZERO FORCE":
+                return f"ERR ZERO offset {z:.3f} too large (ZERO FORCE overrides)"
             self.zero_offset = z
+            self.zero_forced = beyond
             self.has_ref = self.pf_init = False
             self.win.clear()
             self.warn_confirm = 0
             self.zero_hist.clear()
+            if beyond:
+                return f"WARN ZERO FORCE offset={z:.3f} mbar exceeds limit; zero_forced logged"
             return f"OK ZERO offset={z:.3f} mbar"
         if cmd == "START":
             if self.state != "IDLE":
@@ -225,7 +231,7 @@ class Supervisor:
         if cmd == "STATUS":
             return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} "
                     f"P_f={self.p_f:.3f} u_open={self.u_open:.1f} integ={self.integ:.3f}")
-        return "ERR unknown command (fake rig: ZERO START STOP RESET STATUS)"
+        return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS LED MODE)"
 
     def enter_trip(self, r: str, clock_us: int) -> None:
         was_on = self.pump_on
@@ -336,11 +342,14 @@ class Rig:
         self.boot_offset_ms = random.uniform(5_000, 50_000)
         self.sup = Supervisor()
         self.plant = Plant(noise=args.noise)
-        self.zero_true = 0.15  # sensor zero error that ZERO removes
+        self.zero_true = args.zero_error  # sensor zero error that ZERO removes
         self.ring: deque = deque(maxlen=int(C["RING_SAMPLES"]))
         self.seq = 0
         self.cmd_queue: deque[str] = deque()
         self.wifi_down = False
+        self.led_mode = "VENT"   # LED_MODE_DEFAULT
+        self.led_on = False
+        self.t3: tuple[int, str] = (0, "NONE")
         self.clients: set[ServerConnection] = set()
         self.new_sample = asyncio.Event()
 
@@ -359,7 +368,8 @@ class Rig:
             if sc == "ramp":
                 self.plant.inflow = 148.0
                 self.plant.vent_blocked = True
-            self.cmd_queue.append("START")
+            if not self.args.no_autostart:
+                self.cmd_queue.append("START")
         if sc == "ramp" and self.plant.vent_blocked and self.sup.state == "TRIPPED":
             self.plant.vent_blocked = False
         if sc == "sensor_loss":
@@ -392,12 +402,33 @@ class Rig:
             self.scenario(t)
             self.plant.step(period, self.sup.pump_on, self.sup.valve_duty)
             v = self.plant.v_gpio_mv(self.zero_true)
+            if self.led_mode == "SAMPLE":
+                self.led_on = not self.led_on  # toggles at t0, like the firmware
             cmd = self.cmd_queue.popleft() if self.cmd_queue else None
-            _pump, _duty, reply = self.sup.step(now_us, v, True, cmd, self.clock_us())
+            reply = None
+            if cmd and cmd.startswith("LED MODE "):
+                mode = cmd.split()[-1]
+                if mode in ("SAMPLE", "VENT"):
+                    self.led_mode = mode
+                    reply = f"OK LED MODE {mode}"
+                else:
+                    reply = "ERR LED MODE SAMPLE|VENT"
+                cmd = None
+            _pump, _duty, sreply = self.sup.step(now_us, v, True, cmd, self.clock_us())
+            reply = reply or sreply
             if self.sup.trip_new:
                 self.sup.trip_output_us = self.clock_us()
+                if C["READBACK_ENABLED"]:
+                    # simulated MOSFET OFF edge: 2-6 ms valve response (Table C)
+                    self.t3 = (self.sup.trip_output_us + random.randint(2000, 6000), "READBACK")
+                else:
+                    self.t3 = (self.sup.trip_output_us, "SOFTWARE")
+            if self.sup.state != "TRIPPED":
+                self.t3 = (0, "NONE")
+            if self.led_mode == "VENT":
+                self.led_on = self.sup.valve_duty <= 0.0
             if reply:
-                print(f"[fake_rig] {cmd} -> {reply}", flush=True)
+                print(f"[fake_rig] {cmd or 'LED MODE'} -> {reply}", flush=True)
             s = self.sup
             sample = {
                 "type": "sample", "seq": self.seq, "t_esp_ms": now_us // 1000,
@@ -410,8 +441,11 @@ class Rig:
                 "loop_period_us": now_us - prev_us, "replayed": False,
                 "slope": round(s.slope, 4) if s.slope_ok else None,
                 "v_gpio_mv": round(v, 1), "sensor_fault": (not s.valid) and not s.stale(now_us),
-                "zero_offset": round(s.zero_offset, 4),
+                "zero_offset": round(s.zero_offset, 4), "zero_forced": s.zero_forced,
                 "trip_decision_us": s.trip_decision_us, "trip_output_us": s.trip_output_us,
+                "t3_us": self.t3[0], "t3_source": self.t3[1], "led_on": self.led_on,
+                "rb_valve_off": bool(C["READBACK_ENABLED"]) and s.valve_duty <= 0.0,
+                "rb_pump_off": bool(C["READBACK_ENABLED"]) and not s.pump_on,
             }
             prev_us = now_us
             self.ring.append(sample)
@@ -429,10 +463,23 @@ class Rig:
         return None
 
     async def handler(self, ws: ServerConnection) -> None:
+        # Same policy as net_task.cpp: live samples first, backlog interleaved at REPLAY_RATE_HZ.
         self.clients.add(ws)
-        nxt = self.ring[0]["seq"] if self.ring else 0
-        replay_until = self.ring[-1]["seq"] if self.ring else -1
-        print(f"[fake_rig] client connected; replaying {replay_until - nxt + 1} samples", flush=True)
+        replaying = bool(self.ring)
+        replay_next = self.ring[0]["seq"] if self.ring else 0
+        replay_end = self.ring[-1]["seq"] if self.ring else -1
+        live_next = replay_end + 1
+        tokens, last = 0.0, time.perf_counter()
+        rate = C["REPLAY_RATE_HZ"]
+        print(f"[fake_rig] client connected; backlog {replay_end - replay_next + 1} samples", flush=True)
+
+        async def send(seq: int, replayed: bool) -> None:
+            oldest = self.ring[0]["seq"]
+            if seq < oldest:
+                return
+            s = dict(self.ring[seq - oldest])
+            s["replayed"] = replayed
+            await ws.send(json.dumps(s, separators=(",", ":")))
 
         async def reader() -> None:
             async for msg in ws:
@@ -454,25 +501,39 @@ class Rig:
                 if not self.ring:
                     await asyncio.sleep(0.01)
                     continue
-                oldest, newest = self.ring[0]["seq"], self.ring[-1]["seq"]
-                if nxt < oldest:
-                    nxt = oldest
-                if nxt > newest:
+                did = False
+                # 1) live samples first, always
+                if live_next <= self.ring[-1]["seq"]:
+                    await self.net_delay()
+                    burst = 0
+                    while live_next <= self.ring[-1]["seq"] and burst < C["NET_SEND_BURST"]:
+                        late = self.ring[-1]["seq"] - live_next >= C["REPLAY_LAG_SAMPLES"]
+                        await send(live_next, late)
+                        live_next += 1
+                        burst += 1
+                    did = True
+                # 2) backlog, rate-limited token bucket
+                now = time.perf_counter()
+                tokens = min(2.0, tokens + (now - last) * rate)
+                last = now
+                if replaying and tokens >= 1.0:
+                    await self.net_delay()
+                    while replaying and tokens >= 1.0:
+                        replay_next = max(replay_next, self.ring[0]["seq"])
+                        if replay_next > replay_end:
+                            replaying = False
+                            print("[fake_rig] backlog replay complete", flush=True)
+                            break
+                        await send(replay_next, True)
+                        replay_next += 1
+                        tokens -= 1.0
+                    did = True
+                if not did:
                     self.new_sample.clear()
                     try:
-                        await asyncio.wait_for(self.new_sample.wait(), 0.2)
+                        await asyncio.wait_for(self.new_sample.wait(), 0.01 if replaying else 0.2)
                     except TimeoutError:
                         pass
-                    continue
-                burst = 0
-                await self.net_delay()
-                while nxt <= newest and burst < C["NET_SEND_BURST"]:
-                    s = dict(self.ring[nxt - oldest])
-                    s["replayed"] = nxt <= replay_until or (newest - nxt) >= C["REPLAY_LAG_SAMPLES"]
-                    await ws.send(json.dumps(s, separators=(",", ":")))
-                    nxt += 1
-                    burst += 1
-                await asyncio.sleep(0.001)
         except ConnectionClosed:
             pass
         finally:
@@ -521,6 +582,8 @@ def main() -> None:
     ap.add_argument("--outage-at", type=float, default=60.0)
     ap.add_argument("--outage-len", type=float, default=60.0)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--zero-error", type=float, default=0.15, help="sensor zero error, mbar (ZERO removes it)")
+    ap.add_argument("--no-autostart", action="store_true", help="stay in IDLE (type START)")
     ap.add_argument("--duration", type=float, default=0.0, help="exit after N s (0 = run forever)")
     args = ap.parse_args()
     if args.seed is not None:

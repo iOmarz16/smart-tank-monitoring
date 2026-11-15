@@ -76,6 +76,9 @@ Serial commands (type and press Enter):
 | `STOP` | RUN, TEST | IDLE: pump OFF, valve OPEN |
 | `RESET` | TRIPPED | back to IDLE, only if P < 20 mbar(g) and the sensor is valid |
 | `ZERO` | IDLE | stores the mean of the last 1 s as the zero offset (NVS); refused if > ±3 mbar |
+| `ZERO FORCE` | IDLE | same, but accepts an offset beyond ±3 mbar. Prints a `WARN` line; `zero_forced=true` is then logged in every sample (and shown on the dashboard) until a normal `ZERO` |
+| `LED MODE SAMPLE` | any | GPIO2 LED toggles at t0 of every sample (I1 video) |
+| `LED MODE VENT` | any | GPIO2 LED ON while the vent is commanded fully open (I6b video). **Default at boot** |
 | `TEST` | IDLE | test mode, outputs under manual control, **trip limits still active** |
 | `TEST PUMP ON` / `OFF` | TEST | pump |
 | `TEST VALVE ENERGIZE` / `RELEASE` | TEST | valve closed / open |
@@ -113,6 +116,50 @@ Follow Figure 12 and assembly step 6 of §5.1.1. Lid open or HV-101 open, so the
 ### Zeroing (§5.1.1 step 8, before each test day)
 Let the filled rig settle for about 1 h with the headspace vented to atmosphere. In IDLE type `ZERO`.
 The offset is saved and survives reboots. Then do the 60 s zero-flow check.
+If `ZERO` is refused (offset beyond ±3 mbar), first check that the vessel really is vented and that
+the range selector is on 3000 Pa. Use `ZERO FORCE` only once you know why the offset is large.
+
+### 3.1 Optional: output read-back for I3a (GPIO32 / GPIO33)
+
+Off by default (`READBACK_ENABLED = false` in `config.h`). When it is off, t3 is the software
+timestamp taken right after the outputs are written (`t3_source = SOFTWARE`).
+
+**Never wire a MOSFET output directly to the ESP32.** The valve output switches 12 V and the pump
+output switches 5 V; the ESP32 inputs tolerate 3.3 V at most.
+
+1. **Check the module polarity first** (power on, ESP32 not connected, TRIG touched to 3.3 V and
+   released). The 400 W dual-MOSFET trigger modules are expected to switch **low-side**:
+   - `OUT+` stays at the supply voltage all the time (12 V or 5 V), whether TRIG is high or low;
+   - `OUT−` reads ≈ 0 V while TRIG is high (load ON) and rises to the supply through the load when
+     TRIG is low (load OFF).
+
+   If you measure that instead, the logic below holds. If `OUT−` does **not** behave like this, stop:
+   the read-back logic would be inverted and must be changed in `readback.cpp`.
+2. Take the read-back from **`OUT−`** (measured against the common GND) through a divider:
+
+   | Line | From | Divider (top / bottom to GND) | At the pin |
+   |---|---|---|---|
+   | valve | MOSFET 1 `OUT−` (12 V) | **36 kΩ / 10 kΩ** → GPIO32 | 2.61 V at 12.0 V (2.87 V at 13.2 V) |
+   | pump | MOSFET 2 `OUT−` (5 V) | **10 kΩ / 12 kΩ** → GPIO33 | 2.73 V at 5.0 V |
+
+   Both stay below 3.0 V and above the ESP32's 2.475 V minimum HIGH level (0.75 × 3.3 V) with
+   Buck 2 set to 12.0 V and Buck 1 to 5.0 V. The 36k/10k divider is only valid for a valve rail of
+   about 11.4–13.8 V; keep Buck 2 at 12.0 V as Figure 12 requires. Check with a multimeter at the
+   GPIO side of each divider, with the ESP32 **disconnected**, before connecting it:
+   ≤ 3.0 V with the output OFF, ≈ 0 V with it ON.
+3. Logic: **input HIGH = output OFF** (valve de-energized = vent open; pump stopped). A rising edge
+   is the output turning off; the firmware timestamps it in an interrupt.
+4. Set `READBACK_ENABLED = true`, rebuild and flash. At boot the console prints `readback=ENABLED`.
+   The samples then carry `rb_valve_off` / `rb_pump_off`, and after a trip `t3_us` is the latest
+   OFF edge of the outputs that were ON at the decision (`t3_source = READBACK`).
+   `READBACK_TIMEOUT` means no edge came within 1 s: check the wiring.
+
+GPIO32/33 are input-capable ADC1 pins with no boot strapping function, so they are safe to use.
+
+### 3.2 GPIO2 LED (I1 / I6b video)
+The DevKit's onboard LED is on GPIO2, a strapping pin that must be LOW at reset. The board's LED and
+resistor to GND keep it LOW, and the firmware drives it LOW first thing in `setup()`. **Do not
+connect anything that pulls GPIO2 high**; otherwise the board cannot enter flashing mode.
 
 ---
 
@@ -129,13 +176,22 @@ It turns grey "NO DATA" when samples stop for more than 3 s. Latency (median / p
 replayed samples. The clock offset comes from 100 ping round trips at connect (minimum RTT) and is
 refreshed every 30 s.
 
+After a Wi-Fi reconnect the ESP32 sends live samples first and replays the backlog interleaved at
+100 samples/s (`REPLAY_RATE_HZ`), so the latency of live updates is not affected by the replay; a
+150 s backlog drains in about 17 s. "Missing seq" can be above 0 during that time and must return to 0.
+
+The **LED sync** tile is a black/white square that copies the GPIO2 LED state of the newest live
+sample at the moment it arrives. Film it together with the LED for the I1 cross-check.
+
 ### Without hardware
 ```bat
 run_fake_rig.bat --scenario normal          :: or ramp | sensor_loss | wifi_outage
 run_dashboard.bat --rig ws://127.0.0.1:8765/
 ```
 `fake_rig.py` runs a Python port of the firmware logic (constants read from `config.h`) on a
-simple headspace model. You can type `START` / `STOP` / `RESET` / `ZERO` / `STATUS` in its window.
+simple headspace model. You can type `START` / `STOP` / `RESET` / `ZERO [FORCE]` / `STATUS` /
+`LED MODE SAMPLE|VENT` in its window. `--no-autostart` stays in IDLE; `--zero-error 3.6` simulates a
+large sensor offset to try `ZERO FORCE`.
 It is a test tool, not a validated model. Its own Python loop can stretch a few loop periods while
 it replays after a reconnect, so `analyze_log.py` may report I2 FAIL on fake-rig logs; that says
 nothing about the ESP32.
@@ -159,15 +215,15 @@ below 20 mbar(g), type `RESET` on the serial console to return to IDLE.
 
 | Test | Procedure | Pass criterion | Tool output |
 |---|---|---|---|
-| **I1** Spec 4 | RUN for 10 min (≈ 6000 updates) with the dashboard open. Cross-check 20 updates with 240 fps video (see open item O2). | every update ≤ 1.0 s; report median / p95 / max | `I1` |
+| **I1** Spec 4 | RUN for 10 min (≈ 6000 updates) with the dashboard open. For the cross-check, `LED MODE SAMPLE`, then film the ESP32 LED (t0) and the dashboard **LED sync** square (t4) in one 240 fps shot; for 20 transitions, t4 − t0 = frames between the LED change and the square change ÷ 240. Set `LED MODE VENT` again afterwards. | every update ≤ 1.0 s; report median / p95 / max | `I1` |
 | **I2** Spec 5 | RUN for 10 min. Mid-run, switch the **laptop** Wi-Fi off for 60 s, then on again. | mean ≤ 100 ms, no period > 110 ms, ≥ 5 samples per 1 s, timestamps increasing, no missing seq | `I2` |
-| **I3a** Spec 6 | Vent-closed ramp (above) to the trip. 10 repeats. | t3 − t1 ≤ 1.0 s | extras: `t1 -> output write` (software t3; hardware t3 see O1) |
+| **I3a** Spec 6 | Vent-closed ramp (above) to the trip. 10 repeats. For hardware t3, wire and enable the read-back (section 3.1). | t3 − t1 ≤ 1.0 s | extras: `t3 - t1 (..., READBACK)` or `SOFTWARE` when read-back is off |
 | **I3b** | Same ramp to 15 mbar(g), then pull the PT-101 OUT wire. | pump OFF and vent OPEN ≤ 1.0 s after the 0.5 s timeout (`trip_reason=SENSOR_LOSS`) | `EVENT` line, `STATUS`, CSV |
-| **I3c** | Repeat I3a and I3b with the dashboard closed and the laptop Wi-Fi off. | same, with no network | serial `EVENT` + `STATUS` (`trip_dec_us`, `trip_out_us`) |
+| **I3c** | Repeat I3a and I3b with the dashboard closed and the laptop Wi-Fi off. | same, with no network | serial `EVENT` + `STATUS` (`trip_dec_us`, `trip_out_us`); or reconnect the dashboard within 150 s and the samples (with `t3_us`) are replayed |
 | **I4** Constraint 4 | Run the P5 sequence with the laptop on M021-RIG only. Review the code for external hosts: `git grep -nIE "https?://\|ntp\|pool\.\|\.com\|\.org" -- firmware dashboard tools` (expected matches today: `127.0.0.1` in `dashboard/app.py`, and false positives like `re.compile`; none in `firmware/`). | control, warning, trip and logging all work; no external address | — |
 | **I5** IS2 | P6: steady at 10 mbar(g) in RUN, step FI-101 98.7 → 148 std cm³/min, five repeats. | logged and recomputed duty differ ≤ 1 % at every sample; 0–100 % without windup | `I5` |
 | **I6a** IS1 | 30 mbar/min vent-closed ramp: warning on the dashboard vs the PT-101 crossing of 20 mbar(g). | warning ≥ 10 s before 20 mbar(g) | extras: `warning lead at the dashboard` |
-| **I6b** IS3 | Film a water U-tube (204 mm H₂O = 20 mbar(g)) and the vent at 240 fps. | vent open ≤ 1.0 s after the true crossing | video. If it fails, set `LAG_COMP_ENABLED = true` (after approval) |
+| **I6b** IS3 | `LED MODE VENT` (default). Vent-closed ramp; film the water U-tube (204 mm H₂O = 20 mbar(g)) and the GPIO2 LED, which lights when the vent is commanded open, at 240 fps. | vent open ≤ 1.0 s after the true crossing | video. If it fails, set `LAG_COMP_ENABLED = true` (after approval) |
 
 **P5** (Table G): vent-closed ramp as above, warning at 14, vent open at 20, peak ≤ 22 and never > 29.
 Then `RESET` once P < 20, `START` again, and unplug the supply at 15 mbar(g): the valve must vent.
@@ -176,10 +232,7 @@ Then `RESET` once P < 20, `START` again, and unplug the supply at 15 mbar(g): th
 
 ## 6. Open items
 
-- **O1** I3a t3 "read by a spare ESP32 input": no input pin is assigned in Figure 12, so it is not in
-  the firmware. The CSV has software timestamps (`trip_decision_us`, `trip_output_us`).
-- **O2** I1 and I6b mention an LED toggled at t0 and a vent LED. The build has no LED output; the
-  DevKit's onboard LED (GPIO2) is not in Figure 12. Not implemented without approval.
-- **O3** `PUMP_OFF_AT_SOFT_LIMIT = true` (Spec 6) vs Table D (pump off only at 29): waiting for CHE.
-- **O4** `ZERO` refuses offsets above ±3 mbar (assumption A13): confirm.
-- Nothing here has run on the real ESP32 yet. See the summary in the last commit.
+- **O3** `PUMP_OFF_AT_SOFT_LIMIT = true` (Spec 6) vs Table D (pump off only at 29): kept until CHE confirms.
+- The MOSFET modules' low-side switching (section 3.1, step 1) must be confirmed with a multimeter
+  before the read-back is wired.
+- Nothing here has run on the real ESP32 yet.

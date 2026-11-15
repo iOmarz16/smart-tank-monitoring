@@ -1,5 +1,5 @@
 // Serial task: core 0, low priority. Operator-only commands over USB (115200).
-//   ZERO | START | STOP | RESET | STATUS
+//   ZERO [FORCE] | START | STOP | RESET | STATUS | LED MODE SAMPLE|VENT
 //   TEST | TEST PUMP ON|OFF | TEST VALVE ENERGIZE|RELEASE | TEST DUTY <0-100> | TEST EXIT
 // Commands are queued to the control task, which owns all state and outputs.
 #include <Arduino.h>
@@ -20,7 +20,21 @@ static bool parse(char *line, Command *cmd) {
   char *t3 = strtok(nullptr, " \t");
   if (!t1) return false;
   cmd->arg = 0;
-  if (!strcmp(t1, "ZERO")) { cmd->type = CmdType::ZERO; return true; }
+  if (!strcmp(t1, "ZERO")) {
+    cmd->type = CmdType::ZERO;
+    if (!t2) return true;
+    if (strcmp(t2, "FORCE")) return false;
+    cmd->arg = 1;
+    return true;
+  }
+  if (!strcmp(t1, "LED")) {
+    if (!t2 || !t3 || strcmp(t2, "MODE")) return false;
+    cmd->type = CmdType::LED_MODE;
+    if (!strcmp(t3, "SAMPLE")) cmd->arg = (int)LedMode::SAMPLE;
+    else if (!strcmp(t3, "VENT")) cmd->arg = (int)LedMode::VENT;
+    else return false;
+    return true;
+  }
   if (!strcmp(t1, "START")) { cmd->type = CmdType::START; return true; }
   if (!strcmp(t1, "STOP")) { cmd->type = CmdType::STOP; return true; }
   if (!strcmp(t1, "RESET")) { cmd->type = CmdType::RESET; return true; }
@@ -55,8 +69,8 @@ static bool parse(char *line, Command *cmd) {
 }
 
 static void printHelp() {
-  Serial.println(F("Commands: ZERO START STOP RESET STATUS | TEST, TEST PUMP ON|OFF, "
-                   "TEST VALVE ENERGIZE|RELEASE, TEST DUTY <0-100>, TEST EXIT"));
+  Serial.println(F("Commands: ZERO [FORCE], START, STOP, RESET, STATUS, LED MODE SAMPLE|VENT | "
+                   "TEST, TEST PUMP ON|OFF, TEST VALVE ENERGIZE|RELEASE, TEST DUTY <0-100>, TEST EXIT"));
 }
 
 static void handleLine(char *line) {
@@ -86,6 +100,7 @@ static void handleLine(char *line) {
     Preferences p;
     if (p.begin("m021", false)) {
       p.putFloat("zero", r.zero_offset);
+      p.putBool("zforced", r.zero_forced);
       p.end();
     } else {
       Serial.println(F("WARN could not open NVS; zero offset not persisted"));
