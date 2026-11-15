@@ -1,0 +1,5 @@
+# Dashboard + tools (Python 3.13). Install once while online:
+#   py -3.13 -m venv dashboard\.venv
+#   dashboard\.venv\Scripts\python -m pip install -r requirements.txt
+# Everything else (chart, fonts, styles) is local; nothing is fetched at runtime.
+websockets==15.0.1

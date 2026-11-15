@@ -1,0 +1,531 @@
+"""Fake rig: an ESP32 stand-in speaking exactly the firmware WebSocket protocol.
+
+It runs a Python port of firmware/src/supervisor.cpp (constants are read from
+firmware/include/config.h so they cannot drift), a simple headspace model, and
+the same ring-buffer / replay / ping-pong behaviour as firmware/src/net_task.cpp.
+
+Usage (from the repo root):
+    dashboard\\.venv\\Scripts\\python tools\\fake_rig.py --scenario normal
+    ... then start the dashboard with --rig ws://127.0.0.1:8765/
+
+Scenarios:
+    normal       START after 2 s, hold 10 mbar(g) at 98.7 std cm3/min
+    ramp         vent blocked (P5-style), 148 std cm3/min: warning at 14, trip at 20;
+                 the block is released when the trip fires so the vent can act
+    sensor_loss  hold at 10; PT-101 wire breaks at 60 s (reads 0 V), restored at 90 s
+    wifi_outage  hold at 10; every client dropped and refused from 60 s for 60 s
+
+Console (stdin) commands, like the USB serial port: ZERO START STOP RESET STATUS.
+This is a test tool: it is NOT a verified model of the rig.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import random
+import re
+import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from pathlib import Path
+
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_H = ROOT / "firmware" / "include" / "config.h"
+
+
+# ---------------------------------------------------------------------------
+# Constants from config.h
+# ---------------------------------------------------------------------------
+def load_config(path: Path = CONFIG_H) -> dict:
+    cfg: dict[str, object] = {}
+    pat = re.compile(r"constexpr\s+[\w:]+\s+(\w+)\s*=\s*([^;{]+);")
+    for m in pat.finditer(path.read_text(encoding="utf-8")):
+        name, raw = m.group(1), m.group(2).strip()
+        raw = raw.rstrip("fF") if re.fullmatch(r"-?[\d.]+[fF]", raw) else raw
+        if raw in ("true", "false"):
+            cfg[name] = raw == "true"
+            continue
+        try:
+            cfg[name] = int(raw)
+        except ValueError:
+            try:
+                cfg[name] = float(raw)
+            except ValueError:
+                pass  # expressions are not needed here
+    m = re.search(r"WS_PORT\s*=\s*(\d+)", path.read_text(encoding="utf-8"))
+    if m:
+        cfg["WS_PORT"] = int(m.group(1))
+    return cfg
+
+
+C = load_config()
+
+
+# ---------------------------------------------------------------------------
+# Supervisor: line-by-line port of firmware/src/supervisor.cpp
+# ---------------------------------------------------------------------------
+NAN = float("nan")
+
+
+@dataclass
+class Supervisor:
+    zero_offset: float = 0.0
+    state: str = "BOOT"
+    reason: str = "NONE"
+    pump_allowed_in_trip: bool = False
+    trip_new: bool = False
+    trip_decision_us: int = 0
+    trip_output_us: int = 0
+    valid: bool = False
+    has_ref: bool = False
+    last_valid_p: float = 0.0
+    last_valid_us: int = 0
+    p_raw: float = 0.0
+    reref_count: int = 0
+    reref_min: float = 0.0
+    reref_max: float = 0.0
+    plaus_low_since_us: int = 0
+    zero_hist: deque = field(default_factory=lambda: deque(maxlen=int(C["ZERO_AVERAGE_SAMPLES"])))
+    pf_init: bool = False
+    p_f: float = 0.0
+    win: deque = field(default_factory=lambda: deque(maxlen=int(C["SLOPE_WINDOW"])))
+    slope: float = 0.0
+    slope_ok: bool = False
+    t_to_limit: float = 0.0
+    t_to_limit_ok: bool = False
+    warn_confirm: int = 0
+    warning: bool = False
+    integ: float = 0.0
+    u_open: float = 100.0
+    valve_duty: float = 0.0
+    pump_on: bool = False
+
+    def begin(self, now_us: int) -> None:
+        self.last_valid_us = now_us
+
+    def stale(self, now_us: int) -> bool:
+        return now_us - self.last_valid_us > C["SENSOR_TIMEOUT_MS"] * 1000
+
+    def validate(self, now_us: int, v_mv: float, read_ok: bool) -> None:
+        self.valid = False
+        if not read_ok:
+            self.p_raw = NAN
+            self.reref_count = 0
+            return
+        p_uncorr = (v_mv / 1000.0) * C["DIVIDER_RATIO"] * C["SENSOR_MBAR_PER_V"]
+        p = p_uncorr - self.zero_offset
+        self.p_raw = p
+        if p < C["P_VALID_MIN"]:
+            self.reref_count = 0
+            return
+        ok = True
+        if self.has_ref and (self.last_valid_p - p) > C["P_MAX_DROP_PER_SAMPLE"]:
+            ok = False
+            if self.reref_count == 0:
+                self.reref_min = self.reref_max = p
+                self.reref_count = 1
+            else:
+                self.reref_min = min(self.reref_min, p)
+                self.reref_max = max(self.reref_max, p)
+                if self.reref_max - self.reref_min > C["REREF_MAX_SPREAD"]:
+                    self.reref_min = self.reref_max = p
+                    self.reref_count = 1
+                else:
+                    self.reref_count += 1
+            if self.state == "TRIPPED" and self.reref_count >= C["REREF_SAMPLES"]:
+                ok = True
+        if not ok:
+            return
+        self.reref_count = 0
+        self.valid = True
+        self.has_ref = True
+        self.last_valid_p = p
+        self.last_valid_us = now_us
+        self.zero_hist.append(p_uncorr)
+        if not self.pf_init:
+            self.p_f, self.pf_init = p, True
+        else:
+            a = C["PF_ALPHA"]
+            self.p_f = a * p + (1 - a) * self.p_f
+        self.win.append((now_us, self.p_f))
+        self.update_warning()
+
+    def update_warning(self) -> None:
+        self.slope_ok = self.t_to_limit_ok = False
+        n = C["SLOPE_WINDOW"]
+        if len(self.win) == n:
+            tn = self.win[-1][0]
+            ts = [-(tn - t) / 1e6 for t, _ in self.win]
+            ps = [p for _, p in self.win]
+            st, sp = sum(ts), sum(ps)
+            stt = sum(t * t for t in ts)
+            stp = sum(t * p for t, p in zip(ts, ps))
+            den = n * stt - st * st
+            if den > 1e-9:
+                self.slope = (n * stp - st * sp) / den
+                self.slope_ok = True
+        rule = False
+        if self.slope_ok and self.slope > C["MIN_WARNING_SLOPE"]:
+            self.t_to_limit = (C["P_SOFT_LIMIT"] - self.p_f) / self.slope
+            self.t_to_limit_ok = True
+            rule = self.t_to_limit <= C["WARN_HORIZON_S"]
+        self.warn_confirm = self.warn_confirm + 1 if rule else 0
+        self.warning = self.p_f >= C["P_WARNING"] or self.warn_confirm >= C["WARN_CONFIRM_SAMPLES"]
+
+    def execute(self, cmd: str, now_us: int) -> str:
+        ok = self.valid and not self.stale(now_us)
+        if cmd == "ZERO":
+            if self.state != "IDLE":
+                return f"ERR ZERO only in IDLE, state={self.state}"
+            if not ok or len(self.zero_hist) < C["ZERO_AVERAGE_SAMPLES"]:
+                return "ERR ZERO needs valid samples"
+            z = sum(self.zero_hist) / len(self.zero_hist)
+            if abs(z) > C["ZERO_MAX_ABS_OFFSET"]:
+                return f"ERR ZERO offset {z:.3f} too large"
+            self.zero_offset = z
+            self.has_ref = self.pf_init = False
+            self.win.clear()
+            self.warn_confirm = 0
+            self.zero_hist.clear()
+            return f"OK ZERO offset={z:.3f} mbar"
+        if cmd == "START":
+            if self.state != "IDLE":
+                return f"ERR START only from IDLE, state={self.state}"
+            if not ok:
+                return "ERR START needs a valid sensor sample"
+            self.state, self.integ, self.plaus_low_since_us = "RUN", 0.0, 0
+            return "OK RUN"
+        if cmd == "STOP":
+            if self.state in ("RUN", "TEST"):
+                self.state = "IDLE"
+                return "OK IDLE"
+            if self.state == "TRIPPED":
+                return f"ERR trip latched ({self.reason}): use RESET"
+            return f"OK already {self.state}"
+        if cmd == "RESET":
+            if self.state != "TRIPPED":
+                return f"ERR not tripped, state={self.state}"
+            if not ok:
+                return "ERR RESET refused: sensor not valid"
+            if not self.p_raw < C["RESET_MAX_PRESSURE"]:
+                return f"ERR RESET refused: P={self.p_raw:.2f}"
+            self.state, self.reason = "IDLE", "NONE"
+            self.pump_allowed_in_trip = False
+            self.trip_decision_us = self.trip_output_us = 0
+            return "OK RESET -> IDLE"
+        if cmd == "STATUS":
+            return (f"state={self.state} trip={self.reason} P_raw={self.p_raw:.3f} "
+                    f"P_f={self.p_f:.3f} u_open={self.u_open:.1f} integ={self.integ:.3f}")
+        return "ERR unknown command (fake rig: ZERO START STOP RESET STATUS)"
+
+    def enter_trip(self, r: str, clock_us: int) -> None:
+        was_on = self.pump_on
+        self.state, self.reason, self.trip_new = "TRIPPED", r, True
+        self.trip_decision_us, self.trip_output_us = clock_us, 0
+        self.pump_allowed_in_trip = (not C["PUMP_OFF_AT_SOFT_LIMIT"]) and r == "SOFT_LIMIT" and was_on
+
+    def evaluate_trip(self, now_us: int, clock_us: int) -> None:
+        plaus_fail = False
+        if self.state == "RUN" and self.pump_on:
+            if self.valid:
+                if self.p_raw < C["PLAUS_MIN_PRESSURE"]:
+                    if self.plaus_low_since_us == 0:
+                        self.plaus_low_since_us = now_us
+                else:
+                    self.plaus_low_since_us = 0
+            if self.plaus_low_since_us and now_us - self.plaus_low_since_us > C["PLAUS_TIMEOUT_MS"] * 1000:
+                plaus_fail = True
+        else:
+            self.plaus_low_since_us = 0
+        hard = self.valid and self.p_raw >= C["P_HARD_LIMIT"]
+        p_soft = self.p_raw
+        if C["LAG_COMP_ENABLED"] and self.slope_ok:
+            p_soft = max(self.p_raw, self.p_raw + C["LAG_COMP_S"] * self.slope)
+        soft = self.valid and p_soft >= C["P_SOFT_LIMIT"]
+        loss = self.stale(now_us) or plaus_fail
+        r = "HARD_LIMIT" if hard else "SOFT_LIMIT" if soft else "SENSOR_LOSS" if loss else "NONE"
+        if self.state != "TRIPPED":
+            if r != "NONE":
+                self.enter_trip(r, clock_us)
+        elif self.pump_allowed_in_trip and (hard or loss):
+            self.pump_allowed_in_trip = False
+            self.reason = "HARD_LIMIT" if hard else "SENSOR_LOSS"
+
+    def compute_outputs(self) -> tuple[bool, float]:
+        pump, duty = False, 0.0
+        if self.state in ("BOOT", "IDLE"):
+            self.u_open = 100.0
+        elif self.state == "TRIPPED":
+            self.u_open = 100.0
+            pump = self.pump_allowed_in_trip
+        elif self.state == "RUN":
+            pump = True
+            if self.valid:
+                e = self.p_f - C["SETPOINT"]
+                s = self.integ + e
+                k = C["TS_S"] / C["TI_S"]
+                u_cand = C["KC"] * (e + k * s)
+                if (u_cand > 100 and e > 0) or (u_cand < 0 and e < 0):
+                    s = self.integ
+                self.integ = s
+                self.u_open = min(100.0, max(0.0, C["KC"] * (e + k * self.integ)))
+            duty = 100.0 - self.u_open
+        self.pump_on = pump
+        self.valve_duty = max(0.0, duty)
+        return pump, self.valve_duty
+
+    def step(self, now_us: int, v_mv: float, read_ok: bool, cmd: str | None, clock_us: int):
+        self.trip_new = False
+        self.validate(now_us, v_mv, read_ok)
+        if self.state == "BOOT" and self.valid:
+            self.state = "IDLE"
+        reply = self.execute(cmd, now_us) if cmd else None
+        self.evaluate_trip(now_us, clock_us)
+        pump, duty = self.compute_outputs()
+        return pump, duty, reply
+
+
+# ---------------------------------------------------------------------------
+# Plant: 5.0 L headspace, C = 5.20 std cm3/mbar (Section 5.2.1),
+# open vent passes 250 std cm3/min at 10 mbar(g) (HYSYS calibration).
+# ---------------------------------------------------------------------------
+@dataclass
+class Plant:
+    p: float = 0.0             # true pressure, mbar(g)
+    p_sensor: float = 0.0      # after the ~1 s QBM2030 lag
+    inflow: float = 98.7       # std cm3/min while the pump runs
+    cap: float = 5.20          # std cm3/mbar
+    k_vent: float = 25.0       # std cm3/min per mbar at full open
+    tau_s: float = 1.0
+    noise: float = 0.10
+    vent_blocked: bool = False
+    wire_broken: bool = False
+
+    def step(self, dt: float, pump: bool, valve_duty: float) -> None:
+        q_in = self.inflow if pump else 0.0
+        open_frac = 0.0 if self.vent_blocked else (100.0 - valve_duty) / 100.0
+        q_out = self.k_vent * max(self.p, 0.0) * open_frac
+        self.p += (q_in - q_out) / self.cap / 60.0 * dt
+        self.p_sensor += (self.p - self.p_sensor) * min(1.0, dt / self.tau_s)
+
+    def v_gpio_mv(self, zero_true: float) -> float:
+        if self.wire_broken:
+            return 0.0
+        p = self.p_sensor + zero_true + random.gauss(0.0, self.noise)
+        v = max(0.0, p) / C["SENSOR_MBAR_PER_V"] / C["DIVIDER_RATIO"] * 1000.0
+        return min(v, 3100.0)  # ADC ceiling at 11 dB
+
+
+# ---------------------------------------------------------------------------
+# Rig: 10 Hz loop + ring buffer + WebSocket server
+# ---------------------------------------------------------------------------
+class Rig:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.t0 = time.perf_counter()
+        # Rig clock: ms since "boot", deliberately unrelated to the PC clock, with drift.
+        self.boot_offset_ms = random.uniform(5_000, 50_000)
+        self.sup = Supervisor()
+        self.plant = Plant(noise=args.noise)
+        self.zero_true = 0.15  # sensor zero error that ZERO removes
+        self.ring: deque = deque(maxlen=int(C["RING_SAMPLES"]))
+        self.seq = 0
+        self.cmd_queue: deque[str] = deque()
+        self.wifi_down = False
+        self.clients: set[ServerConnection] = set()
+        self.new_sample = asyncio.Event()
+
+    def clock_us(self) -> int:
+        el = time.perf_counter() - self.t0
+        return int((el * (1 + self.args.drift_ppm * 1e-6)) * 1e6 + self.boot_offset_ms * 1000)
+
+    def esp_ms(self) -> float:
+        return self.clock_us() / 1000.0
+
+    # --- scenario timeline -------------------------------------------------
+    def scenario(self, t: float) -> None:
+        sc = self.args.scenario
+        if t >= 2.0 and not getattr(self, "_started", False):
+            self._started = True
+            if sc == "ramp":
+                self.plant.inflow = 148.0
+                self.plant.vent_blocked = True
+            self.cmd_queue.append("START")
+        if sc == "ramp" and self.plant.vent_blocked and self.sup.state == "TRIPPED":
+            self.plant.vent_blocked = False
+        if sc == "sensor_loss":
+            self.plant.wire_broken = 60.0 <= t < 90.0
+        if sc == "wifi_outage":
+            down = self.args.outage_at <= t < self.args.outage_at + self.args.outage_len
+            if down and not self.wifi_down:
+                print(f"[fake_rig] Wi-Fi DOWN at t={t:.1f} s", flush=True)
+                for ws in list(self.clients):
+                    ws.transport.abort()  # abrupt, like a lost radio link
+            if not down and self.wifi_down:
+                print(f"[fake_rig] Wi-Fi UP at t={t:.1f} s", flush=True)
+            self.wifi_down = down
+
+    # --- 10 Hz control loop ---------------------------------------------------
+    async def control_loop(self) -> None:
+        period = C["CONTROL_PERIOD_MS"] / 1000.0
+        self.sup.begin(self.clock_us())
+        prev_us = self.clock_us()
+        next_t = time.perf_counter()
+        while True:
+            next_t += period
+            await asyncio.sleep(max(0.0, next_t - time.perf_counter()))
+            now_us = self.clock_us()
+            t = time.perf_counter() - self.t0
+            self.scenario(t)
+            self.plant.step(period, self.sup.pump_on, self.sup.valve_duty)
+            v = self.plant.v_gpio_mv(self.zero_true)
+            cmd = self.cmd_queue.popleft() if self.cmd_queue else None
+            _pump, _duty, reply = self.sup.step(now_us, v, True, cmd, self.clock_us())
+            if self.sup.trip_new:
+                self.sup.trip_output_us = self.clock_us()
+            if reply:
+                print(f"[fake_rig] {cmd} -> {reply}", flush=True)
+            s = self.sup
+            sample = {
+                "type": "sample", "seq": self.seq, "t_esp_ms": now_us // 1000,
+                "P_raw": None if math.isnan(s.p_raw) else round(s.p_raw, 4),
+                "P_f": round(s.p_f, 4) if s.pf_init else None, "valid": s.valid,
+                "u_open": round(s.u_open, 4), "integ": round(s.integ, 5),
+                "valve_duty": round(s.valve_duty, 4), "pump_on": s.pump_on, "warning": s.warning,
+                "t_to_limit": round(s.t_to_limit, 2) if s.t_to_limit_ok else None,
+                "state": s.state, "trip": s.state == "TRIPPED", "trip_reason": s.reason,
+                "loop_period_us": now_us - prev_us, "replayed": False,
+                "slope": round(s.slope, 4) if s.slope_ok else None,
+                "v_gpio_mv": round(v, 1), "sensor_fault": (not s.valid) and not s.stale(now_us),
+                "zero_offset": round(s.zero_offset, 4),
+                "trip_decision_us": s.trip_decision_us, "trip_output_us": s.trip_output_us,
+            }
+            prev_us = now_us
+            self.ring.append(sample)
+            self.seq += 1
+            if self.seq % 50 == 0 or self.sup.trip_new:
+                print(f"[fake_rig] t={t:6.1f}s seq={self.seq} state={s.state} P={s.p_raw:6.2f} "
+                      f"P_true={self.plant.p:6.2f} u_open={s.u_open:5.1f} warn={s.warning} "
+                      f"trip={s.reason} clients={len(self.clients)}", flush=True)
+            self.new_sample.set()
+
+    # --- WebSocket ------------------------------------------------------------
+    def process_request(self, connection, request):
+        if self.wifi_down:
+            return connection.respond(HTTPStatus.SERVICE_UNAVAILABLE, "Wi-Fi down (simulated)\n")
+        return None
+
+    async def handler(self, ws: ServerConnection) -> None:
+        self.clients.add(ws)
+        nxt = self.ring[0]["seq"] if self.ring else 0
+        replay_until = self.ring[-1]["seq"] if self.ring else -1
+        print(f"[fake_rig] client connected; replaying {replay_until - nxt + 1} samples", flush=True)
+
+        async def reader() -> None:
+            async for msg in ws:
+                try:
+                    m = json.loads(msg)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(m, dict) or m.get("type") != "ping":
+                    continue  # the only accepted inbound message
+                t_pc = m.get("t_pc")
+                if not isinstance(t_pc, (int, float)) or isinstance(t_pc, bool):
+                    continue
+                await self.net_delay()
+                await ws.send(json.dumps({"type": "pong", "t_pc": t_pc, "t_esp": round(self.esp_ms(), 3)}))
+
+        rtask = asyncio.create_task(reader())
+        try:
+            while True:
+                if not self.ring:
+                    await asyncio.sleep(0.01)
+                    continue
+                oldest, newest = self.ring[0]["seq"], self.ring[-1]["seq"]
+                if nxt < oldest:
+                    nxt = oldest
+                if nxt > newest:
+                    self.new_sample.clear()
+                    try:
+                        await asyncio.wait_for(self.new_sample.wait(), 0.2)
+                    except TimeoutError:
+                        pass
+                    continue
+                burst = 0
+                await self.net_delay()
+                while nxt <= newest and burst < C["NET_SEND_BURST"]:
+                    s = dict(self.ring[nxt - oldest])
+                    s["replayed"] = nxt <= replay_until or (newest - nxt) >= C["REPLAY_LAG_SAMPLES"]
+                    await ws.send(json.dumps(s, separators=(",", ":")))
+                    nxt += 1
+                    burst += 1
+                await asyncio.sleep(0.001)
+        except ConnectionClosed:
+            pass
+        finally:
+            rtask.cancel()
+            self.clients.discard(ws)
+            print("[fake_rig] client disconnected", flush=True)
+
+    async def net_delay(self) -> None:
+        d = self.args.net_delay_ms + random.expovariate(1.0 / max(self.args.net_jitter_ms, 0.001))
+        await asyncio.sleep(d / 1000.0)
+
+    # --- console --------------------------------------------------------------
+    def console_thread(self, loop: asyncio.AbstractEventLoop) -> None:
+        for line in sys.stdin:
+            cmd = line.strip().upper()
+            if cmd:
+                loop.call_soon_threadsafe(self.cmd_queue.append, cmd)
+
+    async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        threading.Thread(target=self.console_thread, args=(loop,), daemon=True).start()
+        async with serve(self.handler, self.args.host, self.args.port,
+                         process_request=self.process_request, ping_interval=None,
+                         max_queue=64):
+            print(f"[fake_rig] scenario={self.args.scenario} listening on "
+                  f"ws://{self.args.host}:{self.args.port}/  (type START/STOP/RESET/ZERO/STATUS)",
+                  flush=True)
+            if self.args.duration > 0:
+                try:
+                    await asyncio.wait_for(self.control_loop(), self.args.duration)
+                except TimeoutError:
+                    print("[fake_rig] duration reached, exiting", flush=True)
+            else:
+                await self.control_loop()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scenario", choices=["normal", "ramp", "sensor_loss", "wifi_outage"], default="normal")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--noise", type=float, default=0.10, help="sensor noise, mbar (1 sigma)")
+    ap.add_argument("--net-delay-ms", type=float, default=4.0, help="one-way base delay")
+    ap.add_argument("--net-jitter-ms", type=float, default=6.0, help="mean extra delay (exponential)")
+    ap.add_argument("--drift-ppm", type=float, default=30.0, help="rig clock drift vs PC")
+    ap.add_argument("--outage-at", type=float, default=60.0)
+    ap.add_argument("--outage-len", type=float, default=60.0)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--duration", type=float, default=0.0, help="exit after N s (0 = run forever)")
+    args = ap.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+    try:
+        asyncio.run(Rig(args).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
