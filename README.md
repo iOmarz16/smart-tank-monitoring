@@ -87,6 +87,21 @@ Do not change pins, thresholds, gains or timings without team approval.
   `BROWNOUT` it adds a warning: a latched trip was lost with the reset. Every sample also carries
   `reset_reason`.
 
+### Bring-up firmware (wiring checks only)
+A separate environment, `bringup` (`firmware/bringup/bringup.cpp`), for the first hardware test.
+It is **not** the controller: no PI, no Wi-Fi, no NVS, no sensor-loss detection (a broken PT-101
+wire reads ~0 mbar), so stay at the rig. GPIO26/27 go LOW first in `setup()`; it prints
+`v_gpio_mv`, `P_mbar` (= mV × 0.015, no zero offset), pump and valve every 200 ms, and checks
+P ≥ 20 mbar → pump OFF + valve released + `TRIP` every 50 ms.
+```bat
+cd firmware
+pio run -e bringup -t upload --upload-port COM5
+pio device monitor -e bringup -p COM5
+```
+Commands: `p<N>` pump ON for N s (1–30), `v1` valve energize (closed), `v0` release (open),
+`s` stop (pump OFF, valve released), `r` clear a TRIP (only if P < 20). Flash the controller
+again afterwards with `pio run -t upload --upload-port COM5`.
+
 Serial commands (type and press Enter):
 
 | Command | Allowed in | Effect |
