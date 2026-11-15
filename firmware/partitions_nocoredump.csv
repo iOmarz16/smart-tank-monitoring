@@ -1,0 +1,11 @@
+# TEAM M021 - Arduino-ESP32 2.0.17 default.csv WITHOUT the coredump partition (review M2).
+# On a panic (task watchdog included) the core would otherwise write a core dump to flash
+# before rebooting, holding the outputs at their last state meanwhile. With no partition,
+# the dump is skipped and the board reboots at once (pull-downs: pump OFF, valve OPEN).
+# All other offsets are unchanged, so the NVS (zero offset) survives the re-flash.
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x140000,
+app1,     app,  ota_1,   0x150000,0x140000,
+spiffs,   data, spiffs,  0x290000,0x160000,

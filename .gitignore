@@ -16,3 +16,5 @@ dashboard/.venv/
 dashboard/logs/
 *.csv
 !tools/testdata/*.csv
+# Partition table used by the firmware build (platformio.ini board_build.partitions)
+!firmware/partitions_nocoredump.csv
