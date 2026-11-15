@@ -90,9 +90,16 @@ static bool sendSample(uint8_t client, uint32_t seq, bool replayed) {
 }
 
 void netTask(void *) {
+  printHeap("before Wi-Fi");
   startAccessPoint();
   g_ws.begin();
   g_ws.onEvent(onEvent);
+  // A33: at least HEAP_MIN_FREE_AFTER_WIFI must remain with Wi-Fi and WebSocket up.
+  const size_t free_after = printHeap("after Wi-Fi + WebSocket");
+  if (free_after < HEAP_MIN_FREE_AFTER_WIFI) {
+    Serial.printf("WARNING free heap %u < %u bytes after Wi-Fi (A33): report this, do not run tests\n",
+                  (unsigned)free_after, (unsigned)HEAP_MIN_FREE_AFTER_WIFI);
+  }
 
   for (;;) {
     g_ws.loop();

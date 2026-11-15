@@ -1,24 +1,269 @@
 #include "ring.h"
 
 #include <Arduino.h>
+#include <esp_heap_caps.h>
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "config.h"
 
+// Memory fix (A33). The first version held 1500 full Sample structs (96 B) in ONE
+// calloc of 144 KB, larger than the largest free block of the ESP32 heap (~110 KB), so
+// it failed on the real board. Now:
+//   - each sample is stored packed in 44 B (scaled integers, bitfields; seq is implicit)
+//   - the buffer is RING_SAMPLES / RING_CHUNK_SAMPLES separate allocations
+// 1500 x 44 B = 66 KB in 10 blocks of 6.6 KB. The control logic never reads the ring:
+// packing only quantizes the LOGGED values (see the scales below and docs/protocol.md).
+
 namespace ring {
 
-static Sample *g_buf = nullptr;
-static uint32_t g_count = 0;   // total samples ever pushed
-static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+namespace {
+
+// Scales of the stored values (value = stored / scale).
+constexpr float SC_MV = 10.0f;      // v_gpio_mv: 0.1 mV, 0..6553.5
+constexpr float SC_P = 500.0f;      // p_raw, p_f: 0.002 mbar, +/-65.5 mbar(g)
+constexpr float SC_SLOPE = 1000.0f; // slope: 0.001 mbar/s, +/-32.7
+constexpr float SC_TTL = 50.0f;     // t_to_limit: 0.02 s, +/-655 s
+constexpr float SC_PCT = 100.0f;    // u_open, valve_duty: 0.01 %, 0..655 %
+constexpr float SC_ZERO = 5000.0f;  // zero_offset: 0.0002 mbar, +/-6.55 (cap is 5)
+constexpr int16_t S16_NAN = INT16_MIN;
+
+struct Packed {
+  uint32_t t_esp_ms;
+  uint32_t loop_period_us;
+  float integ;                // kept as float: the I5 recomputation uses it directly
+  uint32_t trip_dec_lo;       // trip_decision_us, low 32 bits
+  uint32_t t3_delta1;         // t3_us - trip_decision_us + 1; 0 = t3_us is 0
+  uint32_t state : 3;
+  uint32_t trip_reason : 2;
+  uint32_t t3_source : 2;
+  uint32_t valid : 1;
+  uint32_t sensor_fault : 1;
+  uint32_t pump_on : 1;
+  uint32_t warning : 1;
+  uint32_t trip : 1;
+  uint32_t led_on : 1;
+  uint32_t zero_forced : 1;
+  uint32_t rb_valve_off : 1;
+  uint32_t rb_pump_off : 1;
+  uint32_t test_pump_timeout : 1;
+  uint32_t trip_latched : 1;
+  uint32_t auto_clear_event : 1;
+  uint32_t auto_clears : 4;
+  uint32_t reset_reason : 5;
+  uint16_t v_gpio;
+  int16_t p_raw;
+  int16_t p_f;
+  int16_t slope;
+  int16_t t_to_limit;
+  uint16_t u_open;
+  uint16_t valve_duty;
+  int16_t zero_offset;
+  uint16_t trip_dec_hi;       // trip_decision_us, bits 32..47 (8.9 years of uptime)
+  uint16_t out_delta1;        // trip_output_us - trip_decision_us + 1 (saturates); 0 = none
+};
+static_assert(sizeof(Packed) == 44, "packed sample layout changed");
+static_assert(RING_SAMPLES % RING_CHUNK_SAMPLES == 0, "RING_SAMPLES must be a multiple of the chunk");
+static_assert(RING_SAMPLES >= 900, "ring must hold >= 900 samples (60 s outage + margin): ask first");
+static_assert((int)State::TRIPPED < 8 && (int)TripReason::HARD_LIMIT < 4 &&
+                  (int)T3Source::READBACK_TIMEOUT < 4,
+              "enum does not fit its bitfield");
+static_assert(SOFT_AUTOCLEAR_MAX < 16, "auto_clears does not fit its bitfield");
+
+constexpr uint32_t N_CHUNKS = RING_SAMPLES / RING_CHUNK_SAMPLES;
+
+Packed *g_chunks[N_CHUNKS] = {nullptr};
+uint32_t g_count = 0;  // total samples ever pushed
+portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
+
+int16_t encS16(float x, float scale) {
+  if (isnan(x)) return S16_NAN;
+  float v = roundf(x * scale);
+  if (v > 32767.0f) v = 32767.0f;
+  if (v < -32767.0f) v = -32767.0f;  // -32768 is the NaN marker
+  return (int16_t)v;
+}
+float decS16(int16_t v, float scale) { return v == S16_NAN ? NAN : (float)v / scale; }
+
+uint16_t encU16(float x, float scale) {
+  if (isnan(x)) return 0;
+  float v = roundf(x * scale);
+  if (v > 65535.0f) v = 65535.0f;
+  if (v < 0.0f) v = 0.0f;
+  return (uint16_t)v;
+}
+float decU16(uint16_t v, float scale) { return (float)v / scale; }
+
+void pack(const Sample &s, Packed *p) {
+  p->t_esp_ms = s.t_esp_ms;
+  p->loop_period_us = s.loop_period_us;
+  p->integ = s.integ;
+  p->trip_dec_lo = (uint32_t)(s.trip_decision_us & 0xFFFFFFFFULL);
+  p->trip_dec_hi = (uint16_t)((s.trip_decision_us >> 32) & 0xFFFFULL);
+  if (s.trip_output_us == 0 || s.trip_output_us < s.trip_decision_us) {
+    p->out_delta1 = 0;
+  } else {
+    const uint64_t d = s.trip_output_us - s.trip_decision_us + 1;
+    p->out_delta1 = d > 0xFFFFULL ? 0xFFFF : (uint16_t)d;
+  }
+  if (s.t3_us == 0 || s.t3_us < s.trip_decision_us) {
+    p->t3_delta1 = 0;
+  } else {
+    const uint64_t d = s.t3_us - s.trip_decision_us + 1;
+    p->t3_delta1 = d > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)d;
+  }
+  p->state = (uint32_t)s.state;
+  p->trip_reason = (uint32_t)s.trip_reason;
+  p->t3_source = (uint32_t)s.t3_source;
+  p->valid = s.valid;
+  p->sensor_fault = s.sensor_fault;
+  p->pump_on = s.pump_on;
+  p->warning = s.warning;
+  p->trip = s.trip;
+  p->led_on = s.led_on;
+  p->zero_forced = s.zero_forced;
+  p->rb_valve_off = s.rb_valve_off;
+  p->rb_pump_off = s.rb_pump_off;
+  p->test_pump_timeout = s.test_pump_timeout;
+  p->trip_latched = s.trip_latched;
+  p->auto_clear_event = s.auto_clear_event;
+  p->auto_clears = s.auto_clears > 15 ? 15 : s.auto_clears;
+  p->reset_reason = s.reset_reason > 31 ? 31 : s.reset_reason;
+  p->v_gpio = encU16(s.v_gpio_mv, SC_MV);
+  p->p_raw = encS16(s.p_raw, SC_P);
+  p->p_f = encS16(s.p_f, SC_P);
+  p->slope = encS16(s.slope, SC_SLOPE);
+  p->t_to_limit = encS16(s.t_to_limit, SC_TTL);
+  p->u_open = encU16(s.u_open, SC_PCT);
+  p->valve_duty = encU16(s.valve_duty, SC_PCT);
+  p->zero_offset = encS16(s.zero_offset, SC_ZERO);
+}
+
+void unpack(const Packed &p, uint32_t seq, Sample *s) {
+  memset(s, 0, sizeof(*s));
+  s->seq = seq;
+  s->t_esp_ms = p.t_esp_ms;
+  s->loop_period_us = p.loop_period_us;
+  s->integ = p.integ;
+  s->trip_decision_us = ((uint64_t)p.trip_dec_hi << 32) | p.trip_dec_lo;
+  s->trip_output_us = p.out_delta1 ? s->trip_decision_us + p.out_delta1 - 1 : 0;
+  s->t3_us = p.t3_delta1 ? s->trip_decision_us + p.t3_delta1 - 1 : 0;
+  s->state = (State)p.state;
+  s->trip_reason = (TripReason)p.trip_reason;
+  s->t3_source = (T3Source)p.t3_source;
+  s->valid = p.valid;
+  s->sensor_fault = p.sensor_fault;
+  s->pump_on = p.pump_on;
+  s->warning = p.warning;
+  s->trip = p.trip;
+  s->led_on = p.led_on;
+  s->zero_forced = p.zero_forced;
+  s->rb_valve_off = p.rb_valve_off;
+  s->rb_pump_off = p.rb_pump_off;
+  s->test_pump_timeout = p.test_pump_timeout;
+  s->trip_latched = p.trip_latched;
+  s->auto_clear_event = p.auto_clear_event;
+  s->auto_clears = (uint8_t)p.auto_clears;
+  s->reset_reason = (uint8_t)p.reset_reason;
+  s->v_gpio_mv = decU16(p.v_gpio, SC_MV);
+  s->p_raw = decS16(p.p_raw, SC_P);
+  s->p_f = decS16(p.p_f, SC_P);
+  s->slope = decS16(p.slope, SC_SLOPE);
+  s->t_to_limit = decS16(p.t_to_limit, SC_TTL);
+  s->u_open = decU16(p.u_open, SC_PCT);
+  s->valve_duty = decU16(p.valve_duty, SC_PCT);
+  s->zero_offset = decS16(p.zero_offset, SC_ZERO);
+}
+
+Packed *slot(uint32_t seq) {
+  const uint32_t i = seq % RING_SAMPLES;
+  return &g_chunks[i / RING_CHUNK_SAMPLES][i % RING_CHUNK_SAMPLES];
+}
+
+bool near(float a, float b, float tol) {
+  if (isnan(a) || isnan(b)) return isnan(a) && isnan(b);
+  return fabsf(a - b) <= tol;
+}
+
+}  // namespace
 
 bool init() {
-  g_buf = (Sample *)calloc(RING_SAMPLES, sizeof(Sample));
-  return g_buf != nullptr;
+  for (uint32_t c = 0; c < N_CHUNKS; c++) {
+    g_chunks[c] = (Packed *)heap_caps_calloc(RING_CHUNK_SAMPLES, sizeof(Packed),
+                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!g_chunks[c]) {
+      for (uint32_t k = 0; k < c; k++) {
+        heap_caps_free(g_chunks[k]);
+        g_chunks[k] = nullptr;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t bytes() { return (size_t)RING_SAMPLES * sizeof(Packed); }
+
+bool selfTest() {
+  // Round trip of representative and edge values through pack/unpack (A33). It runs
+  // on the target at boot, because no host compiler is available for a unit test.
+  Sample a{};
+  a.seq = 7;
+  a.t_esp_ms = 123456789UL;
+  a.loop_period_us = 100004;
+  a.v_gpio_mv = 1333.37f;
+  a.p_raw = 19.9993f;
+  a.p_f = NAN;
+  a.slope = -0.1234f;
+  a.t_to_limit = 12.345f;
+  a.u_open = 37.256f;
+  a.integ = 123.45678f;
+  a.valve_duty = 62.744f;
+  a.zero_offset = -4.9998f;
+  a.trip_decision_us = 0x123456789ABULL;
+  a.trip_output_us = a.trip_decision_us + 37;
+  a.t3_us = a.trip_decision_us + 912345;
+  a.state = State::TRIPPED;
+  a.trip_reason = TripReason::HARD_LIMIT;
+  a.t3_source = T3Source::READBACK_TIMEOUT;
+  a.valid = a.pump_on = a.trip = a.zero_forced = a.rb_pump_off = a.trip_latched = true;
+  a.auto_clears = 3;
+  a.reset_reason = 10;
+  Packed p{};
+  pack(a, &p);
+  Sample b;
+  unpack(p, a.seq, &b);
+  bool ok = b.seq == a.seq && b.t_esp_ms == a.t_esp_ms && b.loop_period_us == a.loop_period_us &&
+            b.integ == a.integ && b.trip_decision_us == a.trip_decision_us &&
+            b.trip_output_us == a.trip_output_us && b.t3_us == a.t3_us && b.state == a.state &&
+            b.trip_reason == a.trip_reason && b.t3_source == a.t3_source && b.valid &&
+            !b.sensor_fault && b.pump_on && !b.warning && b.trip && !b.led_on && b.zero_forced &&
+            !b.rb_valve_off && b.rb_pump_off && !b.test_pump_timeout && b.trip_latched &&
+            !b.auto_clear_event && b.auto_clears == 3 && b.reset_reason == 10 &&
+            near(b.v_gpio_mv, a.v_gpio_mv, 0.05f) && near(b.p_raw, a.p_raw, 0.001f) &&
+            near(b.p_f, a.p_f, 0.0f) && near(b.slope, a.slope, 0.0005f) &&
+            near(b.t_to_limit, a.t_to_limit, 0.01f) && near(b.u_open, a.u_open, 0.005f) &&
+            near(b.valve_duty, a.valve_duty, 0.005f) && near(b.zero_offset, a.zero_offset, 0.0001f);
+  // No trip: all trip times 0. Out of range values saturate instead of wrapping.
+  Sample c{};
+  c.p_raw = 99.0f;
+  c.p_f = -99.0f;
+  c.u_open = 100.0f;
+  c.t_to_limit = NAN;
+  pack(c, &p);
+  unpack(p, 0, &b);
+  ok = ok && b.trip_decision_us == 0 && b.trip_output_us == 0 && b.t3_us == 0 &&
+       near(b.p_raw, 32767.0f / SC_P, 0.0f) && near(b.p_f, -32767.0f / SC_P, 0.0f) &&
+       near(b.u_open, 100.0f, 0.0f) && isnan(b.t_to_limit);
+  return ok;
 }
 
 void push(const Sample &s) {
+  Packed p{};
+  pack(s, &p);  // outside the critical section
   portENTER_CRITICAL(&g_mux);
-  g_buf[s.seq % RING_SAMPLES] = s;
+  *slot(s.seq) = p;
   g_count = s.seq + 1;
   portEXIT_CRITICAL(&g_mux);
 }
@@ -38,25 +283,31 @@ bool range(uint32_t *oldest, uint32_t *newest) {
 }
 
 bool get(uint32_t seq, Sample *out) {
+  Packed p{};
   bool ok = false;
   portENTER_CRITICAL(&g_mux);
   uint32_t o, n;
   if (rangeLocked(&o, &n) && seq >= o && seq <= n) {
-    *out = g_buf[seq % RING_SAMPLES];
+    p = *slot(seq);
     ok = true;
   }
   portEXIT_CRITICAL(&g_mux);
+  if (ok) unpack(p, seq, out);
   return ok;
 }
 
 bool latest(Sample *out) {
+  Packed p{};
+  uint32_t seq = 0;
   bool ok = false;
   portENTER_CRITICAL(&g_mux);
   if (g_count > 0) {
-    *out = g_buf[(g_count - 1) % RING_SAMPLES];
+    seq = g_count - 1;
+    p = *slot(seq);
     ok = true;
   }
   portEXIT_CRITICAL(&g_mux);
+  if (ok) unpack(p, seq, out);
   return ok;
 }
 

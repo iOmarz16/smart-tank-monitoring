@@ -31,6 +31,10 @@ extern bool g_boot_zero_ok;
 extern volatile uint32_t g_adc_read_us;
 extern volatile uint32_t g_adc_read_us_max;
 
+// Prints free heap, largest free block and minimum free heap (8-bit capable RAM),
+// tagged with where in the boot it was taken (A33). Returns the free heap.
+size_t printHeap(const char *tag);
+
 // esp_reset_reason() read in setup() (review m3), and its name.
 extern uint8_t g_reset_reason;
 const char *resetReasonName(uint8_t r);

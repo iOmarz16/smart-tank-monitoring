@@ -81,8 +81,12 @@ Do not change pins, thresholds, gains or timings without team approval.
   default without the coredump partition, so a crash reboots at once). The upload writes it; the
   NVS area is at the same address, so a saved zero survives a re-flash.
 - `platformio.ini` sets `monitor_dtr = 0` / `monitor_rts = 0`, so opening `pio device monitor`
-  should not reset the board. **Check this once on the real DevKit**: open the monitor while in
-  IDLE; no `M021 controller boot` line must appear. Other serial programs may still reset it.
+  does not reset the board (verified on the real DevKit). Other serial programs may still reset it.
+- At boot the console prints `HEAP ...` lines: free heap, largest free block and minimum free
+  heap, before and after the ring buffer, before Wi-Fi and after Wi-Fi + WebSocket. The ring holds
+  1500 samples packed at 44 B each, in 10 blocks. If less than 40 KB is free after Wi-Fi, a
+  `WARNING` line follows: report the HEAP lines and do not run tests. `FATAL ring buffer
+  allocation failed` still stops the controller with the outputs safe.
 - At boot the console prints `reset_reason=...`. After `TASK_WDT`, `INT_WDT`, `PANIC`, `WDT` or
   `BROWNOUT` it adds a warning: a latched trip was lost with the reset. Every sample also carries
   `reset_reason`.
@@ -251,12 +255,12 @@ open-circuit reading of your board once, before any pressurized run:
    expected; `v_gpio_mv` is still logged in every sample, so keep recording (use `STATUS` for spot
    values once the TEST lines stop).
 5. Plug the wire back in. `RESET` if tripped (needs a valid sample), `TEST EXIT` otherwise.
-6. **Second case: module-to-ESP32 wire.** Repeat steps 2–5, this time unplugging the wire from the
-   module output to **GPIO34**. GPIO34 has no internal pull resistor, so the pin then **floats**
-   and can read anything, including a plausible pressure that no check catches. Record what it
-   reads. If it does not stay below the threshold, stop and report it: a pull-down from GPIO34 to
-   GND fixes it (1 MΩ shifts the reading by only ~0.6 %), but it is a hardware change for the team
-   to decide.
+6. **Second case: module-to-ESP32 wire** (with the **1 MΩ pull-down GPIO34 → GND** fitted, team
+   decision A32). Repeat steps 2–5, this time unplugging the wire from the module output to
+   **GPIO34**. With the pull-down the pin must read like step 4 (near the ADC floor); without it,
+   GPIO34 floats and can read anything. Include these readings in the maximum of step 7. If it
+   does not stay below the threshold, stop and report it. The pull-down makes the reading
+   ~0.6 % low: redo the two-point U-tube check (P0) after fitting it.
 7. Threshold = **measured max V_gpio (step 4) + margin** (team decision, e.g. 50 mV). It must stay
    **≤ about 300 mV**: a healthy rig on the slowest ramp (10 mbar/min from 0) must cross it well
    inside the 30 s window (with the ÷5 module, 5 mbar(g) = 333 mV at the pin; 300 mV is crossed
@@ -359,16 +363,16 @@ duration: P2 at 10 mbar/min needs ~120 s to 20 mbar(g), so use `TEST PUMP ON 180
 
 - ~~O3~~ resolved: CHE confirmed pump OFF at 20 mbar(g) (`PUMP_OFF_AT_SOFT_LIMIT = true`).
 - `OPEN_CIRCUIT_MV_THRESHOLD` is provisional until the bench measurement of section 3.3 (now ≤ ~300 mV).
-- **GPIO34 floats** if the module-to-ESP32 wire breaks (no pull-down on the as-built input): the
-  reading is then undefined and may look plausible. Measure it in 3.3 step 6; a pull-down from GPIO34
-  to GND is the fix, and that is a team decision.
+- **1 MΩ pull-down GPIO34 → GND** (decided, A32): fit it, verify it with 3.3 step 6, then redo the
+  two-point U-tube check (~0.6 % lower reading).
+- Heap after Wi-Fi: read the boot `HEAP` lines (≥ 40 KB must remain, A33).
 - ADC read time for 32 reads: measure it at bring-up with `STATUS` (`adc_us`, `adc_us_max`).
 - Reading noise without the 100 nF: check the `ZERO` spread (≤ 0.3 mbar) on the real rig.
 - P5 step 3: no agreed way yet to trip in RUN on the rig (see P5).
 - **P1 is blocked pending CHE**: it holds 25 mbar(g), above the 20 mbar(g) trip that is enforced in
   every state, and there is no passive relief. The firmware has no mode that raises or bypasses the
   limit; CHE is asked to run the leak test below 20 mbar(g) (`docs/assumptions.md`, E).
-- `monitor_dtr = 0` / `monitor_rts = 0` (m5): check on the real DevKit that opening the monitor does not reset it.
+- ~~m5~~ resolved: opening the serial monitor did not reset the DevKit.
 - The MOSFET modules' low-side switching (section 3.1, step 1) must be confirmed with a multimeter
   before the read-back is wired.
 - Nothing here has run on the real ESP32 yet.

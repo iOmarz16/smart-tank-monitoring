@@ -3,6 +3,7 @@
 // P-101 pump on GPIO27. See docs/assumptions.md and include/config.h.
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <math.h>
 
@@ -35,6 +36,14 @@ const char *resetReasonName(uint8_t r) {
     case ESP_RST_SDIO: return "SDIO";
     default: return "UNKNOWN";
   }
+}
+
+size_t printHeap(const char *tag) {
+  const size_t free_b = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  Serial.printf("HEAP %-22s free=%u largest_block=%u min_free=%u bytes\n", tag, (unsigned)free_b,
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+  return free_b;
 }
 
 static void haltSafe(const char *why) {
@@ -84,7 +93,18 @@ void setup() {
                 LED_MODE_DEFAULT == LedMode::VENT ? "VENT" : "SAMPLE");
 
   if (!outputs::initPwm()) haltSafe("LEDC setup failed");
+  printHeap("boot (before ring)");
+  // A33: fail-safe kept. If any block cannot be allocated, outputs stay safe and the
+  // controller does not start.
   if (!ring::init()) haltSafe("ring buffer allocation failed");
+  Serial.printf("ring: %lu samples (%lu s) x %u B = %u bytes in %lu blocks\n",
+                (unsigned long)RING_SAMPLES, (unsigned long)(RING_SAMPLES / 10), (unsigned)(ring::bytes() / RING_SAMPLES),
+                (unsigned)ring::bytes(), (unsigned long)(RING_SAMPLES / RING_CHUNK_SAMPLES));
+  printHeap("after ring");
+  if (!ring::selfTest()) {
+    // Logging only: control and trips never read the ring. Report, do not stop.
+    Serial.println(F("WARNING ring pack/unpack self-test FAILED: logged values may be wrong"));
+  }
   g_cmd_queue = xQueueCreate(4, sizeof(Command));
   g_reply_queue = xQueueCreate(2, sizeof(Reply));
   if (!g_cmd_queue || !g_reply_queue) haltSafe("queue allocation failed");

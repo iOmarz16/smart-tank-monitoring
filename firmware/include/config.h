@@ -152,8 +152,15 @@ constexpr uint8_t WIFI_AP_MAX_CLIENTS = 2;
 constexpr uint8_t WIFI_AP_IP[4] = {192, 168, 4, 1};
 constexpr uint16_t WS_PORT = 81;
 
-// Ring buffer: >= 1200 samples (>= 120 s at 10 Hz). 1500 = 150 s.
+// Ring buffer: >= 1200 samples (>= 120 s at 10 Hz). 1500 = 150 s. Never below 900
+// (60 s Wi-Fi outage + margin) without asking the team (A33).
 constexpr uint32_t RING_SAMPLES = 1500;
+// Memory fix (A33): stored packed (44 B/sample) in separate blocks of this many samples,
+// because the heap has no single free block for the whole buffer. 150 x 44 B = 6.6 KB.
+constexpr uint32_t RING_CHUNK_SAMPLES = 150;
+// Free heap that must remain once Wi-Fi and the WebSocket server are up (A33). Checked
+// and printed at boot; below it the console prints a WARNING.
+constexpr uint32_t HEAP_MIN_FREE_AFTER_WIFI = 40 * 1024;
 // A sample sent more than this many samples behind the newest one is flagged replayed.
 constexpr uint32_t REPLAY_LAG_SAMPLES = 3;
 // Max live samples sent per network-task iteration (keeps the task responsive).

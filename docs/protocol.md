@@ -17,6 +17,12 @@ No Internet, DNS, NTP or external host is involved (Constraint 4).
  "trip_latched":false,"auto_clears":0}
 ```
 
+Every sample is stored in the ESP32 ring buffer before it is sent, packed to 44 B (A33). Values
+therefore arrive **quantized**: `v_gpio_mv` 0.1 mV · `P_raw`, `P_f` 0.002 mbar (range ±65.5) ·
+`slope` 0.001 mbar/s · `t_to_limit` 0.02 s · `u_open`, `valve_duty` 0.01 % · `zero_offset`
+0.0002 mbar. `integ`, `t_esp_ms`, `loop_period_us` and all `*_us` trip times are exact. Control and
+trips run on the unquantized values.
+
 | Field | Meaning |
 |---|---|
 | `seq` | strictly increasing from 0 at boot; the dedup key |
