@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M021 Pressure Monitor</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="tag">PT-101</span>
+    <h1>M021 Headspace Pressure <span class="ar">ضغط الفراغ العلوي</span></h1>
+  </div>
+  <div class="bar-right">
+    <span class="viewonly" title="The dashboard has no control over the pump, the valve or the trip">VIEW ONLY · عرض فقط</span>
+    <span id="link" class="link link-down"><i></i><b id="link-text">Connecting…</b></span>
+    <button id="theme" class="theme" type="button" aria-label="Toggle light/dark theme">◐</button>
+  </div>
+</header>
+
+<main>
+  <section class="top">
+    <div id="status" class="status s-nodata" role="status" aria-live="polite">
+      <div class="status-main" id="status-main">NO DATA</div>
+      <div class="status-ar" id="status-ar">لا توجد بيانات</div>
+      <div class="status-sub" id="status-sub">waiting for the rig</div>
+    </div>
+
+    <div class="big">
+      <div class="label">P<sub>f</sub> filtered · الضغط</div>
+      <div class="big-val"><span id="pf">--.--</span><small>mbar(g)</small></div>
+      <div class="big-sub">P<sub>raw</sub> <span id="praw">--</span> · slope <span id="slope">--</span> mbar/s</div>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="label">Vent opening u<sub>open</sub></div><div class="val"><span id="uopen">--</span><small>%</small></div><div class="meter"><i id="uopen-bar"></i></div></div>
+      <div class="tile"><div class="label">Pump P-101 · المضخة</div><div class="val" id="pump">--</div></div>
+      <div class="tile"><div class="label">Valve PCV-101 · الصمام</div><div class="val" id="valve">--</div><div class="tile-sub" id="valve-sub">&nbsp;</div></div>
+      <div class="tile"><div class="label">Time to 20 mbar(g)</div><div class="val"><span id="ttl">--</span><small>s</small></div></div>
+      <div class="tile tile-wide"><div class="label">ESP32 state · الحالة</div><div class="val" id="state">--</div><div class="tile-sub" id="state-sub">&nbsp;</div></div>
+    </div>
+  </section>
+
+  <section class="card chart-card">
+    <div class="card-head">
+      <h2>Pressure, last 5 min <span class="ar">آخر ٥ دقائق</span></h2>
+      <div class="legend">
+        <span><i class="sw sw-pf"></i>P<sub>f</sub></span>
+        <span><i class="sw sw-raw"></i>P<sub>raw</sub></span>
+        <span><i class="sw sw-sp"></i>10 setpoint</span>
+        <span><i class="sw sw-warn"></i>14 warning</span>
+        <span><i class="sw sw-trip"></i>20 limit</span>
+        <span><i class="sw sw-hard"></i>29 hard trip</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart" aria-label="Pressure chart"></canvas></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Link and latency <span class="ar">الاتصال وزمن الاستجابة</span> <span class="muted">test I1 · replayed samples excluded</span></h2></div>
+    <div class="stats">
+      <div><span class="label">Last sample age</span><b id="age">--</b></div>
+      <div><span class="label">Latency median</span><b id="lat-med">--</b></div>
+      <div><span class="label">Latency p95</span><b id="lat-p95">--</b></div>
+      <div><span class="label">Latency max</span><b id="lat-max">--</b></div>
+      <div><span class="label">Updates measured</span><b id="lat-n">--</b></div>
+      <div><span class="label">Over 1.0 s</span><b id="lat-over">--</b></div>
+      <div><span class="label">Clock offset</span><b id="offset">--</b></div>
+      <div><span class="label">Min RTT</span><b id="rtt">--</b></div>
+      <div><span class="label">Samples logged</span><b id="nsamp">--</b></div>
+      <div><span class="label">Missing seq</span><b id="missing">--</b></div>
+      <div><span class="label">Replayed</span><b id="replayed">--</b></div>
+      <div class="wide"><span class="label">CSV log</span><b id="csv" class="mono">--</b></div>
+    </div>
+  </section>
+</main>
+
+<script src="/chart.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
