@@ -1,0 +1,18 @@
+# Report contains names and invoices: never commit (user instruction, step 1 Q6)
+docs/TEAM_M021_Third_Report.pdf
+docs/*.pdf
+
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+dashboard/.venv/
+
+# Session logs (CSV) produced by the dashboard
+dashboard/logs/
+*.csv
+!tools/testdata/*.csv
