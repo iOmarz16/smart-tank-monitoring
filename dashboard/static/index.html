@@ -11,6 +11,7 @@
   <div class="brand">
     <span class="tag">PT-101</span>
     <h1>M021 Headspace Pressure <span class="ar">ضغط الفراغ العلوي</span></h1>
+    <span id="demo-tag" class="demo-tag" hidden title="DEMO mode: data from tools/fake_rig.py, not the ESP32">DEMO · simulated rig</span>
   </div>
   <div class="bar-right">
     <span class="viewonly" title="The dashboard has no control over the pump, the valve or the trip">VIEW ONLY · عرض فقط</span>
@@ -20,6 +21,21 @@
 </header>
 
 <main>
+  <section id="demo-bar" class="card demo-bar" hidden>
+    <label class="demo-field"><span class="label">Scenario</span>
+      <select id="demo-scn"><option value="">Select a scenario…</option></select>
+    </label>
+    <div class="demo-field"><span class="label">Demo speed (S1 only)</span>
+      <div class="seg" id="demo-speed" role="group" aria-label="Demo speed, S1 only">
+        <button type="button" data-x="1" aria-pressed="true">1×</button><button type="button" data-x="2" aria-pressed="false">2×</button><button type="button" data-x="4" aria-pressed="false">4×</button>
+      </div>
+    </div>
+    <div class="demo-field demo-phase"><span class="label">Simulator</span><b id="demo-phase" class="mono">idle</b></div>
+    <button id="demo-reset" class="demo-reset" type="button">Reset demo</button>
+    <p class="demo-note">These controls drive the simulator (tools/fake_rig.py) only. The dashboard has no control over a real pump, valve or trip.</p>
+  </section>
+  <div id="c4-banner" class="c4-banner" role="note" hidden>all control on the controller; dashboard is view-only; no Internet</div>
+
   <section class="top">
     <div id="status" class="status s-nodata" role="status" aria-live="polite">
       <div class="status-main" id="status-main">NO DATA</div>
@@ -41,6 +57,34 @@
       <div class="tile"><div class="label">LED sync (GPIO2)</div><div class="sync-row"><span id="sync" class="sync" title="Mirrors the ESP32 GPIO2 LED of the newest live sample; film it with the LED for I1 / I6b"></span><span id="sync-sub" class="tile-sub">--</span></div></div>
       <div class="tile"><div class="label">ESP32 state · الحالة</div><div class="val" id="state">--</div><div class="tile-sub" id="state-sub">&nbsp;</div></div>
     </div>
+  </section>
+
+  <section id="s1-panel" class="card" hidden>
+    <div class="card-head">
+      <h2>S1 · ramp rate <span class="muted">CHE specification, shown for the full picture</span></h2>
+      <div class="s1-head-right"><span id="s1-summary" class="s1-summary">S1: 0/3 ramps within ±10 %</span></div>
+    </div>
+    <div class="s1-top">
+      <p class="spec-quote">“5.0 ± 0.2 L gas headspace reproducing 10/20/30 mbar/min pressure ramps within ±10%”</p>
+      <div class="tile s1-vol"><div class="label">Headspace volume</div><div class="val">5.0<small>L</small></div><div class="tile-sub">set by CHE (fixed)</div></div>
+    </div>
+    <div class="legend s1-legend">
+      <span><i class="sw sw-meas"></i>measured PT-101</span>
+      <span><i class="sw sw-target"></i>target slope</span>
+      <span><i class="band-sw"></i>±10 % band</span>
+      <span id="s1-axis-note" class="muted">time axis: process time (s) from each ramp start</span>
+    </div>
+    <div class="chart-wrap s1-chart"><canvas id="s1-chart" aria-label="S1 ramps: pressure against process time, with target slope and ±10 % band"></canvas><div id="s1-tip" class="tip" hidden></div></div>
+    <table class="s1-table">
+      <thead><tr><th>Ramp</th><th>Target</th><th>Band (±10 %)</th><th>Measured slope</th><th>Points</th><th>Result</th></tr></thead>
+      <tbody id="s1-rows"></tbody>
+      <tfoot><tr><td colspan="6" id="s1-foot">S1: 0/3 ramps within ±10 %</td></tr></tfoot>
+    </table>
+  </section>
+
+  <section id="spec-panel" class="card" hidden>
+    <div class="card-head"><h2>Specifications <span class="muted">Table 1 · click a card to run its scenario</span></h2></div>
+    <div id="spec-grid" class="spec-grid"></div>
   </section>
 
   <section class="card chart-card">
@@ -78,6 +122,7 @@
 </main>
 
 <script src="/chart.js"></script>
+<script src="/demo.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

@@ -5,8 +5,8 @@ Usage: python tools/check_rules.py   (exit code 0 = all pass)
 
 This tests the SIMULATOR'S COPY of the logic in tools/fake_rig.py, not the C++ firmware.
 Keep the two in step: a change to supervisor.cpp needs the same change in fake_rig.py.
-TEST mode (including the TEST PUMP ON <seconds> limit) is not simulated, so it is not
-covered here; check it on the bench."""
+TEST mode is ported to the fake rig for the DEMO S1 ramps; section 16 checks the port
+(pump duration cap and auto-OFF, latched trip from TEST). Check the C++ TEST mode on the bench."""
 import sys
 from pathlib import Path
 
@@ -523,6 +523,91 @@ if res:
     check("A35 analyze_log warning lead matches the direct measurement (+/-0.1 s)",
           leads[30] is not None and abs(res[0]["lead_s"] - leads[30]) <= 0.1001,
           f"{res[0]['lead_s']} vs {leads[30]}")
+
+# ---------------------------------------------------------------------------------------
+# 16. DEMO mode (supervisor meeting, fake rig only). The firmware is not touched; the
+#     dashboard stays view-only towards any rig; demo controls reach the SIMULATOR only.
+# ---------------------------------------------------------------------------------------
+import re  # noqa: E402
+
+ROOT = fr.ROOT
+sys.path.insert(0, str(ROOT / "dashboard"))
+import demo_director as dd  # noqa: E402
+import demo_specs as ds  # noqa: E402
+
+# 16a. TEST mode port (used by the S1 ramps), same rules as supervisor.cpp.
+r = Run(zero_ok=True)
+r.hold(0.0, 1)
+check("TEST port: TEST from IDLE", r.step(0.0, "TEST").startswith("OK TEST") and r.s.state == "TEST")
+check("TEST port: TEST PUMP ON 301 refused (cap 300 s)", r.step(0.0, "TEST PUMP ON 301").startswith("ERR")
+      and not r.s.test_pump)
+r.step(0.0, "TEST VALVE ENERGIZE")
+r.step(0.0, "TEST PUMP ON 2")
+check("TEST port: pump ON and valve energized 100 %", r.s.pump_on and r.s.valve_duty == 100.0)
+r.hold(5.0 * MV_PER_MBAR, 2.5)
+check("TEST port: pump turns OFF by itself after its duration", not r.s.pump_on and r.s.test_pump_timeout)
+r.step(5.0 * MV_PER_MBAR, "TEST PUMP ON 60")
+r.to(20.5)
+check("TEST port: a SOFT_LIMIT trip from TEST latches, pump OFF, vent open",
+      r.s.state == "TRIPPED" and r.s.trip_latched and not r.s.pump_on and r.s.valve_duty == 0.0)
+
+# 16b. Scenario lists agree; S1 first (user request).
+check("DEMO scenario ids match the Specifications cards, S1 first",
+      dd.SCENARIO_IDS == ds.CARD_IDS and dd.SCENARIO_IDS[0] == "S1", f"{dd.SCENARIO_IDS} {ds.CARD_IDS}")
+
+# 16c. The director acts like an operator or test bench only: commands through the queue,
+#      plant and Wi-Fi changes; it never writes Supervisor state, limits or outputs.
+dsrc = (ROOT / "tools" / "demo_director.py").read_text(encoding="utf-8")
+check("DEMO director never assigns Supervisor attributes", not re.search(r"\bsup\.\w+\s*(=|\+=|-=)(?!=)", dsrc))
+check("DEMO director never touches config constants", "C[" not in dsrc and "load_config" not in dsrc)
+check("DEMO speed scales the plant in S1 only", 'self.speed if self.sid == "S1" else 1' in dsrc)
+
+# 16d. Firmware unchanged by the demo; no external addresses anywhere (C4 / I4).
+fw = [p for d in ("src", "include") for p in (ROOT / "firmware" / d).glob("*.*")]
+check("firmware has no DEMO code", not [p.name for p in fw if re.search(r"demo", p.read_text(encoding="utf-8"), re.I)])
+hosts = ds.scan_external_hosts()
+check("C4/I4 no external address in firmware, dashboard or fake rig", not hosts, str(hosts))
+
+# 16e. Dashboard: view-only towards the rig; demo requests only in --demo, only to the simulator.
+app_src = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+rig_side = app_src.split("# ------------------------------------------------------------------ rig side")[1]
+rig_side = rig_side.split("# ------------------------------------------------------------- statistics")[0]
+rig_sends = re.findall(r"\.send\((.*)\)", rig_side)
+check("dashboard sends only pings on the rig link",
+      bool(rig_sends) and all('"type": "ping"' in x for x in rig_sends), str(rig_sends))
+bc = app_src.split("    async def broadcast(self, msg: dict)")[1].split("\n    async def ")[0]
+check("a stalled browser tab can never stall the rig reader (broadcast never awaits a send)",
+      "await" not in bc and "put_nowait" in bc)
+check("browser messages are ignored unless --demo",
+      "if not self.demo:\n                    continue  # the browser has nothing to say: view only" in app_src)
+check("demo requests go to the 127.0.0.1 simulator control channel only",
+      'DEMO_CONTROL_URL = f"ws://127.0.0.1:{DEMO_CONTROL_PORT}/"' in app_src
+      and app_src.count("ctl.send(") == 1 and 'DEMO_RIG_URL = "ws://127.0.0.1:8765/"' in app_src
+      and "--demo runs only against its own local simulator" in app_src)
+check("demo CSV logs in dashboard/logs/demo/", 'DEMO_LOGS = LOGS / "demo"' in app_src
+      and "self.log_dir = DEMO_LOGS if demo else LOGS" in app_src)
+rig_src = (ROOT / "tools" / "fake_rig.py").read_text(encoding="utf-8")
+check("fake rig control channel binds 127.0.0.1 and exists only with --demo",
+      'serve(self.control_handler, "127.0.0.1"' in rig_src and "if not self.args.demo:" in rig_src)
+
+# 16f. Evaluator maths on synthetic data.
+f = ds.fit_slope([(t * 0.1, 0.2 + 0.5 * t * 0.1) for t in range(50)])
+check("S1 least-squares slope exact on a straight line", f is not None and abs(f[0] - 0.5) < 1e-9)
+card = ds.S1Card(ds.CARDS[0])
+card.start()
+for rate, slope in ((10, 9.48), (20, 23.0), (30, 28.45)):
+    card.sample({"demo_mark": f"S1 ramp {rate} start", "demo_t_s": 0.0, "P_f": 0.0})
+    for i in range(1, 200):
+        t = i * 0.1
+        p = slope / 60 * t
+        if p > 15:
+            break
+        card.sample({"demo_phase": f"S1 ramp {rate}", "demo_t_s": t, "P_raw": p, "pump_on": True, "valid": True})
+    card.sample({"demo_mark": f"S1 ramp {rate} stop", "demo_t_s": t})
+card.tick({}, False)
+check("S1 card: 9.48 PASS, 23.0 FAIL (band 18-22), 28.45 PASS; summary 2/3",
+      [r["verdict"] for r in card.ramps.values()] == ["PASS", "FAIL", "PASS"] and card.verdict == "FAIL"
+      and card.extra["summary"] == "S1: 2/3 ramps within ±10 %", str(card.extra.get("summary")))
 
 print(f"\n{fails} failure(s)")
 sys.exit(1 if fails else 0)

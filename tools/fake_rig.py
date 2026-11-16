@@ -15,6 +15,8 @@ Scenarios:
                  SOFT_LIMIT trip auto-clears back to RUN at 10 mbar(g) (A30)
     ramp_repeat  as ramp, but the vent is blocked again after every auto-clear: three
                  auto-clears, then the fourth SOFT_LIMIT trip within 5 min latches
+    (--demo)     DEMO mode for the supervisor meeting: tools/demo_director.py runs one
+                 scenario per specification, chosen on the dashboard (app.py --demo)
     sensor_loss  hold at 10; PT-101 wire breaks at 60 s (reads 0 V), restored at 90 s
     wifi_outage  hold at 10; every client dropped and refused from 60 s for 60 s
     open_circuit PT-101 wire broken from boot (review C1): START is accepted (the
@@ -23,7 +25,8 @@ Scenarios:
 
 Console (stdin) commands, like the USB serial port: ZERO [FORCE] START STOP RESET STATUS,
 SIM RAMP <10|20|30>, SIM EXIT (A35; try --no-autostart then SIM RAMP 30),
-LED MODE SAMPLE|VENT. TEST mode is not simulated (a trip from TEST always latches).
+LED MODE SAMPLE|VENT, TEST [PUMP ON <s>|PUMP OFF|VALVE ENERGIZE|RELEASE|DUTY <n>|EXIT]
+(TEST mode is ported for the demo S1 ramps; a trip from TEST always latches).
 The simulated NVS holds a valid zero of 0.000 mbar at start (START allowed); use
 --fresh-nvs to start like a first flash (START refused until ZERO).
 This is a test tool: it is NOT a verified model of the rig.
@@ -135,6 +138,12 @@ class Supervisor:
     u_open: float = 100.0
     valve_duty: float = 0.0
     pump_on: bool = False
+    # TEST mode (port of supervisor.cpp TEST_*; used by the demo S1 ramps)
+    test_pump: bool = False
+    test_pump_since_us: int = 0
+    test_pump_duration_s: int = 0
+    test_pump_timeout: bool = False
+    test_duty: float = 0.0
 
     def begin(self, now_us: int, zero_ok: bool) -> None:
         self.zero_ok = zero_ok and not self.zero_forced
@@ -320,6 +329,47 @@ class Supervisor:
                     f"integ={self.integ:.3f} zero={self.zero_offset:.3f} zero_ok={int(self.zero_ok)} "
                     f"latched={int(self.state == 'TRIPPED' and self.trip_latched)} "
                     f"auto_clears={self.auto_clears_in_window(now_us)}/{C['SOFT_AUTOCLEAR_MAX']}")
+        if cmd == "TEST":
+            if self.state != "IDLE":
+                return f"ERR TEST only from IDLE, state={self.state}"
+            self.set_state("TEST", now_us)
+            self.test_pump = self.test_pump_timeout = False
+            self.test_duty = 0.0
+            return ("OK TEST (trip limits and open-circuit check still enforced; TEST PUMP ON [<s>] "
+                    f"runs the pump {C['TEST_PUMP_DEFAULT_S']} s by default, max {C['TEST_PUMP_MAX_S']} s)")
+        if cmd == "TEST EXIT":
+            if self.state == "TEST":
+                self.set_state("IDLE", now_us)
+                return "OK IDLE"
+            return "ERR not in TEST mode"
+        m = re.fullmatch(r"TEST (PUMP ON(?: (\S+))?|PUMP OFF|VALVE (ENERGIZE|RELEASE)|DUTY (\d{1,3}))", cmd)
+        if m:
+            if self.state != "TEST":
+                return "ERR not in TEST mode (send TEST first)"
+            if m.group(1).startswith("PUMP"):
+                if m.group(1) == "PUMP OFF":
+                    arg = 0
+                elif m.group(2) is None:
+                    arg = C["TEST_PUMP_DEFAULT_S"]
+                else:
+                    a = m.group(2)
+                    arg = int(a) if a.isdigit() and 1 <= int(a) <= C["TEST_PUMP_MAX_S"] else -1
+                if arg < 0:
+                    return f"ERR TEST PUMP ON duration must be 1-{C['TEST_PUMP_MAX_S']} s (pump unchanged)"
+                self.test_pump = arg != 0
+                if self.test_pump:
+                    self.test_pump_since_us, self.test_pump_duration_s = now_us, arg
+                self.test_pump_timeout = False
+            elif m.group(3):
+                self.test_duty = 100.0 if m.group(3) == "ENERGIZE" else 0.0
+            else:
+                if int(m.group(4)) > 100:
+                    return "ERR unknown command"
+                self.test_duty = float(m.group(4))
+            if self.test_pump:
+                return (f"OK TEST pump=ON for {self.test_pump_duration_s} s (then auto-OFF) "
+                        f"valve_duty(energized)={self.test_duty:.0f}%")
+            return f"OK TEST pump=OFF valve_duty(energized)={self.test_duty:.0f}%"
         if cmd.startswith("SIM RAMP"):
             # A35: gate as START (A24); from IDLE or TEST.
             parts = cmd.split()
@@ -335,13 +385,15 @@ class Supervisor:
             self.set_state("SIM", now_us)
             self.sim_rate, self.sim_p0, self.sim_t0_us = rate, self.p_f_real, now_us
             self.integ, self.pi_restart = 0.0, False
+            self.test_pump = self.test_pump_timeout = False  # from TEST: the TEST pump timer no longer applies
             return f"OK SIM RAMP {rate} mbar/min from {self.sim_p0:.2f} mbar(g)"
         if cmd == "SIM EXIT":
             if self.state == "SIM":
                 self.set_state("IDLE", now_us)
                 return "OK IDLE (SIM ended: pump OFF, valve released)"
             return f"ERR not in SIM, state={self.state}"
-        return "ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS SIM RAMP <n> SIM EXIT LED MODE)"
+        return ("ERR unknown command (fake rig: ZERO [FORCE] START STOP RESET STATUS TEST [PUMP ON <s>|PUMP OFF|"
+                "VALVE ENERGIZE|RELEASE|DUTY <n>|EXIT] SIM RAMP <n> SIM EXIT LED MODE)")
 
     def auto_clears_in_window(self, now_us: int) -> int:
         w = C["SOFT_AUTOCLEAR_WINDOW_S"] * 1_000_000
@@ -409,13 +461,20 @@ class Supervisor:
                 and not self.stale(now_us) and self.zero_ok and self.p_real <= C["SOFT_AUTOCLEAR_P"]):
             self.auto_clear(now_us)
 
-    def compute_outputs(self) -> tuple[bool, float]:
+    def compute_outputs(self, now_us: int = 0) -> tuple[bool, float]:
         pump, duty = False, 0.0
         if self.state in ("BOOT", "IDLE"):
             self.u_open = 100.0
         elif self.state == "TRIPPED":
             self.u_open = 100.0
             pump = self.pump_allowed_in_trip
+        elif self.state == "TEST":
+            # Review M1 / A26: the pump turns OFF by itself after the requested duration.
+            if self.test_pump and now_us - self.test_pump_since_us > self.test_pump_duration_s * 1_000_000:
+                self.test_pump, self.test_pump_timeout = False, True
+            pump = self.test_pump
+            duty = self.test_duty
+            self.u_open = 100.0 - self.test_duty
         elif self.state in ("RUN", "SIM"):  # A35: in SIM the PI is computed and logged only
             pump = True
             if self.valid:
@@ -448,7 +507,7 @@ class Supervisor:
         if self.state == "SIM" and now_us - self.sim_t0_us > C["TEST_PUMP_MAX_S"] * 1_000_000:
             self.set_state("IDLE", now_us)  # A35 backstop (not reached: the ramp trips first)
         self.evaluate_trip(now_us, clock_us)
-        pump, duty = self.compute_outputs()
+        pump, duty = self.compute_outputs(now_us)
         return pump, duty, reply
 
 
@@ -535,6 +594,33 @@ class Rig:
         self.model_closed_duty = 0.0
         self.clients: set[ServerConnection] = set()
         self.new_sample = asyncio.Event()
+        # DEMO mode (supervisor meeting): scenario scripts + a local control channel.
+        self.director = None
+        if args.demo:
+            from demo_director import Director
+            self.director = Director(self)
+
+    def reboot(self, p0: float) -> None:
+        """DEMO: simulated controller restart before each scenario (the NVS zero is kept).
+        The vessel starts at p0 mbar(g). seq and the ring keep counting."""
+        self.sup = Supervisor(zero_offset=0.0)
+        self.sup.begin(self.clock_us(), zero_ok=not self.args.fresh_nvs)
+        self.plant = Plant(p=p0, p_sensor=p0, noise=self.args.noise, adc_floor_mv=self.args.adc_floor_mv)
+        self.leak = LeakModel()
+        self.model_pump_on, self.model_closed_duty = False, 0.0
+        self.t3 = (0, "NONE")
+        self.cmd_queue.clear()
+        self.set_wifi(True)
+
+    def set_wifi(self, up: bool) -> None:
+        down = not up
+        if down and not self.wifi_down:
+            print("[fake_rig] Wi-Fi DOWN", flush=True)
+            for ws in list(self.clients):
+                ws.transport.abort()  # abrupt, like a lost radio link
+        if not down and self.wifi_down:
+            print("[fake_rig] Wi-Fi UP", flush=True)
+        self.wifi_down = down
 
     def clock_us(self) -> int:
         el = time.perf_counter() - self.t0
@@ -563,13 +649,9 @@ class Rig:
             self.plant.wire_broken = True
         if sc == "wifi_outage":
             down = self.args.outage_at <= t < self.args.outage_at + self.args.outage_len
-            if down and not self.wifi_down:
-                print(f"[fake_rig] Wi-Fi DOWN at t={t:.1f} s", flush=True)
-                for ws in list(self.clients):
-                    ws.transport.abort()  # abrupt, like a lost radio link
-            if not down and self.wifi_down:
-                print(f"[fake_rig] Wi-Fi UP at t={t:.1f} s", flush=True)
-            self.wifi_down = down
+            if down != self.wifi_down:
+                print(f"[fake_rig] t={t:.1f} s", flush=True)
+            self.set_wifi(not down)
 
     # --- 10 Hz control loop ---------------------------------------------------
     async def control_loop(self) -> None:
@@ -587,8 +669,12 @@ class Rig:
                 pass
             now_us = self.clock_us()
             t = time.perf_counter() - self.t0
-            self.scenario(t)
-            self.plant.step(period, self.sup.pump_on, self.sup.valve_duty)
+            plant_dt = period
+            if self.director is not None:
+                plant_dt = self.director.tick(period)  # DEMO: scenario script (S1 may run the plant faster)
+            else:
+                self.scenario(t)
+            self.plant.step(plant_dt, self.sup.pump_on, self.sup.valve_duty)
             v = self.plant.v_gpio_mv(self.zero_true)
             if self.led_mode == "SAMPLE":
                 self.led_on = not self.led_on  # toggles at t0, like the firmware
@@ -648,6 +734,8 @@ class Rig:
                 "P_corr": r4(p_corr, 4), "P_comp_assumed": r4(p_comp, 2),
                 "leak_rate": r4(leak_rate, 4),
             }
+            if self.director is not None:
+                sample.update(self.director.fields())  # DEMO only: not part of the firmware protocol
             if s.auto_clear_new:
                 print(f"[fake_rig] EVENT AUTO-CLEAR SOFT_LIMIT -> RUN P_raw={s.p_raw:.3f} "
                       f"auto_clears={sample['auto_clears']}/{C['SOFT_AUTOCLEAR_MAX']}", flush=True)
@@ -761,9 +849,41 @@ class Rig:
             if cmd:
                 loop.call_soon_threadsafe(self.cmd_queue.append, cmd)
 
+    # --- DEMO control channel (127.0.0.1 only; the firmware has no such port) ---
+    async def control_handler(self, ws: ServerConnection) -> None:
+        async def push() -> None:
+            while True:
+                await ws.send(json.dumps(self.director.state()))
+                await asyncio.sleep(0.25)
+
+        pusher = asyncio.create_task(push())
+        try:
+            async for msg in ws:
+                try:
+                    m = json.loads(msg)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(m, dict):
+                    continue
+                if m.get("type") == "scenario":
+                    ok = self.director.request(str(m.get("id")))
+                elif m.get("type") == "speed":
+                    ok = isinstance(m.get("x"), int) and self.director.set_speed(m["x"])
+                else:
+                    ok = False
+                await ws.send(json.dumps({"type": "demo_ack", "ok": bool(ok), "req": m}))
+        except ConnectionClosed:
+            pass
+        finally:
+            pusher.cancel()
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
-        threading.Thread(target=self.console_thread, args=(loop,), daemon=True).start()
+        if not self.args.demo:
+            threading.Thread(target=self.console_thread, args=(loop,), daemon=True).start()
+        else:
+            await serve(self.control_handler, "127.0.0.1", self.args.control_port, ping_interval=None)
+            print(f"[fake_rig] DEMO control channel on ws://127.0.0.1:{self.args.control_port}/", flush=True)
         async with serve(self.handler, self.args.host, self.args.port,
                          process_request=self.process_request, ping_interval=None,
                          max_queue=64):
@@ -800,7 +920,13 @@ def main() -> None:
     ap.add_argument("--adc-floor-mv", type=float, default=0.0,
                     help="ESP32 ADC floor: readings below it read as it (real 11 dB: ~75-150 mV)")
     ap.add_argument("--duration", type=float, default=0.0, help="exit after N s (0 = run forever)")
+    ap.add_argument("--demo", action="store_true",
+                    help="DEMO mode (started by dashboard/app.py --demo): scenarios S1 ... C4 chosen on the "
+                         "dashboard through a 127.0.0.1 control channel; no console")
+    ap.add_argument("--control-port", type=int, default=8766, help="DEMO control channel port (127.0.0.1)")
     args = ap.parse_args()
+    if args.demo:
+        args.host = "127.0.0.1"  # the demo never listens beyond this PC
     if args.seed is not None:
         random.seed(args.seed)
     try:

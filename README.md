@@ -19,6 +19,7 @@ safety valve was removed (Table C, §5.1.1). Nothing above the software trips ve
 itself; operation is attended at all times.
 
 The dashboard is **view and log only**. It cannot start, stop or reset anything.
+(DEMO mode, section 4.1, drives only the local simulator, never an ESP32.)
 
 **As built, PT-101 input** (overrides Figure 12): a "Voltage Sensor" module that divides by 5
 (no 33k/10k, no 100 nF) feeds GPIO34. `P_raw = V_gpio[mV] × 0.015 − zero_offset`
@@ -28,9 +29,11 @@ The dashboard is **view and log only**. It cannot start, stop or reset anything.
 ```
 firmware/        PlatformIO project (ESP32, Arduino core 2.0.17); constants in include/config.h
 dashboard/       app.py (backend) + static/ (UI, all local) ; logs/ (session CSVs, git-ignored)
+                 demo_specs.py (DEMO Specifications panel) ; logs/demo/ (DEMO CSVs only)
 tools/           fake_rig.py (simulator, same protocol) ; analyze_log.py (I1, I2, I5 + extras)
+                 demo_director.py (DEMO scenarios, one per specification)
 docs/            assumptions.md, protocol.md, the report (local only)
-run_dashboard.bat, run_fake_rig.bat
+run_dashboard.bat, run_fake_rig.bat, run_demo.bat
 ```
 
 ---
@@ -320,6 +323,45 @@ SOFT_LIMIT auto-clear and latching). They test the simulator's copy of the logic
 **not the C++ firmware**. The fake rig's own Python loop can stretch a few loop periods while
 it replays after a reconnect, so `analyze_log.py` may report I2 FAIL on fake-rig logs; that says
 nothing about the ESP32.
+
+### 4.1 Demo (supervisor meeting, no hardware)
+
+```bat
+run_demo.bat
+```
+One command: it starts `tools\fake_rig.py` and the dashboard in DEMO mode and opens
+`http://127.0.0.1:8000/`. No ESP32 and no M021-RIG Wi-Fi are needed (no Internet either). The
+header shows **DEMO · simulated rig**. Close the window (Ctrl+C) to stop both.
+
+- **Scenario** dropdown (or click a card in **Specifications**): runs one scenario per specification
+  on the simulator. Each run starts from a simulated controller restart. The dropdown, the cards,
+  the speed buttons and **Reset demo** drive the **simulator only** (its own control channel on
+  127.0.0.1:8766); the dashboard still has no control over a real pump, valve or trip.
+- **Specifications** panel: one card per spec with its Table 1 text, the acceptance criterion, the
+  live measured value and **PASS / PENDING / FAIL**. A card keeps its last result while other
+  scenarios run.
+- **Demo speed 1× / 2× / 4×**: S1 only (the slope is judged on process time). Everything else runs
+  in real time, because time is what it measures.
+- **Reset demo**: restarts the simulator and starts a fresh session (all cards back to PENDING).
+- CSV logs: one file per scenario run in `dashboard\logs\demo\` (`demo_<date>_<time>_<id>.csv`, with
+  the extra columns `demo_scenario`, `demo_phase`, `demo_t_s`, `demo_speed`, `demo_mark`), plus the
+  simulator's console output (`fake_rig_<date>_<time>.log`). Never mixed with rig logs.
+
+| Card | Scenario | Shown | Typical time |
+|---|---|---|---|
+| **S1** ramp rate (CHE) | TEST mode, vent closed, pump ON: 10, 20, 30 mbar/min back to back, each from 0, stopped at 15 and vented | Ramp chart (target dashed, ±10 % band), slope per ramp vs 9–11 / 18–22 / 27–33, "S1: 3/3 ramps within ±10 %"; headspace 5.0 L "set by CHE" | 6 min at 1×, 1.5 min at 4× |
+| **S4** UI latency | hold at 10 | live latency median / p95 / max vs 1.0 s | 30 s |
+| **S5** loop and logging | hold at 10, 20 s Wi-Fi outage, replay | loop rate and period, samples per second, missing seq → 0 | 35 s |
+| **S6a** 20 mbar(g) trip | vent blocked, 148 std cm³/min, ramp to 20 | pump OFF, vent open; decision → outputs vs 1.0 s | 25 s |
+| **S6b** sensor loss | PT-101 wire broken | SENSOR_LOSS 0.5–0.6 s after the last valid reading; vent open ≤ 1.0 s | 10 s |
+| **IS1** early warning | ramps at 10, 20, 30 mbar/min to the trip | warning lead before 20 vs ≥ 10 s, per ramp | 2.5 min |
+| **IS2** disturbance | hold, then +4 mbar slug and inflow step 98.7 → 148 | time back inside 10 ± 2 vs 30 s | 30 s |
+| **IS3** safety response | as S6a | response time t1 (first sample ≥ 20) → t3 (outputs) | 25 s |
+| **C4** offline | hold at 10 | banner "all control on the controller; dashboard is view-only; no Internet"; external addresses in the code = 0 | 10 s |
+
+Demo results come from a simulator, not the rig: they show **how** each spec will be checked, not
+that it is met. Details and every demo assumption: `docs/assumptions.md` A36.
+`dashboard\app.py --demo --port 8010 --no-browser` runs it on another port without a browser.
 
 ---
 

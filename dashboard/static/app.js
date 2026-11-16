@@ -1,5 +1,7 @@
 // M021 dashboard front end: view only. It never sends anything to the rig; the local
 // backend (app.py) forwards samples and statistics over ws://127.0.0.1:<port>/ws.
+// DEMO mode only (app.py --demo): demo.js sends scenario / speed / reset requests to the
+// local backend, which forwards them to the SIMULATOR (tools/fake_rig.py), never to an ESP32.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -116,11 +118,23 @@ function render() {
 }
 
 // ---- local WebSocket to the backend ------------------------------------------------
+let backend = null;
+function backendSend(obj) {  // used by demo.js only, and only in DEMO mode
+  if (backend && backend.readyState === WebSocket.OPEN) backend.send(JSON.stringify(obj));
+}
+
 function connectBackend() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
+  backend = ws;
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.type === "history") {
+    if (window.demo && ["mode", "specs", "reset", "demo_ack", "sample", "history"].includes(m.type)) {
+      window.demo.on(m);
+    }
+    if (m.type === "reset") {
+      chart.reset();
+      latest = null;
+    } else if (m.type === "history") {
       chart.reset();
       for (const s of m.samples) { chart.add(s); if (!latest || s.seq > latest.seq) latest = s; }
     } else if (m.type === "sample") {

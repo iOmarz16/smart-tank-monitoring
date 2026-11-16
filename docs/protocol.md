@@ -69,6 +69,17 @@ trips run on the unquantized values.
 Only `{"type":"ping","t_pc":<number>}` is accepted. Every other message is ignored.
 The dashboard has no control authority.
 
+## DEMO mode only (tools/fake_rig.py --demo, A36)
+
+Not part of the firmware protocol; the ESP32 never sends or accepts any of this.
+- Extra sample fields from the simulator: `demo_scenario` (S1, S4, … C4 or empty), `demo_phase`
+  (text), `demo_t_s` (process time since the scenario started, s; faster than real time in S1 at
+  2×/4×), `demo_speed` (1, 2 or 4; always 1 outside S1), `demo_mark` (event on that sample only,
+  e.g. `S1 ramp 10 start`, `wifi down`, `signal lost`, `disturbance`).
+- Simulator control channel `ws://127.0.0.1:8766/` (dashboard backend → simulator):
+  `{"type":"scenario","id":"S1"}`, `{"type":"speed","x":1|2|4}`; the simulator pushes
+  `{"type":"demo_state",...}` every 0.25 s. The data link on 8765 still accepts pings only.
+
 ## Replay
 
 On each (re)connect the whole ring buffer (1500 samples, 150 s) is replayed, flagged
