@@ -1,4 +1,41 @@
-# TEAM M021 — ICS firmware and local dashboard
+# 🛢️ Smart Monitoring & Control System for Oil Storage Tanks
+
+> **KFUPM Senior Design Project — Team M021.** I was responsible for the ICS subsystem: the ESP32 firmware, the control and safety logic, and the monitoring dashboard.
+
+An ESP32-based system that monitors and controls the pressure inside a sealed storage vessel, with layered safety trips, an early-warning alarm, and a real-time local dashboard.  
+The prototype controls the air headspace of a sealed 10 L vessel as a safe, small-scale stand-in for an oil storage tank.
+
+## ✨ Highlights
+- 🎛️ **Closed-loop PI control** holds the headspace at 10 mbar(g) by driving a control valve with PWM.
+- ⚠️ **Early warning** fires at 14 mbar(g), or earlier when the trend predicts the 20 mbar(g) limit within 12 seconds.
+- 🛑 **Layered safety:** a software trip at 20 mbar(g) stops the pump and opens the vent; a latched hard trip at 29 mbar(g); automatic detection of sensor loss.
+- 📡 **Real-time dashboard:** the ESP32 runs its own Wi-Fi network and streams readings over WebSocket to a Python dashboard with live charts and CSV logging. It works fully offline.
+- 🧪 **Simulator and tools:** a fake rig to test the dashboard and logic without hardware, a log analyzer, and an automated rule checker.
+
+## 🛠️ Tech Stack
+| Layer | Tools |
+|---|---|
+| Firmware | C++, ESP32 (Arduino framework), FreeRTOS tasks, PlatformIO |
+| Control | PI controller, PWM valve control, trip and alarm state machine |
+| Communication | ESP32 Wi-Fi access point, WebSocket, JSON |
+| Dashboard | Python (asyncio, websockets), HTML, CSS, JavaScript |
+
+## 📁 Repository Layout
+| Folder | Contents |
+|---|---|
+| `firmware/` | ESP32 firmware: control, network, serial and supervisor tasks |
+| `dashboard/` | Local web dashboard and demo mode |
+| `tools/` | Simulator, log analyzer, rule checker |
+| `docs/` | Design assumptions, wire protocol, integration example |
+
+## 🚀 Quick Start
+1. Copy `firmware/include/secrets.example.h` to `secrets.h` and set your own Wi-Fi name and password.
+2. Build and flash the firmware with PlatformIO.
+3. Install the dashboard requirements (`requirements.txt`) and run `run_dashboard.bat`, or `run_fake_rig.bat` to try it without hardware.
+
+---
+
+## 📘 Technical Documentation — ICS Firmware and Local Dashboard
 
 Pressure control of the 5 L air headspace in a sealed 10 L vessel. All pressures are gauge, **mbar(g)**.
 Source of truth: `docs/TEAM_M021_Third_Report.pdf` (git-ignored: it holds names and invoices).
