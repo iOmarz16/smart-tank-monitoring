@@ -18,3 +18,20 @@ dashboard/logs/
 !tools/testdata/*.csv
 # Partition table used by the firmware build (platformio.ini board_build.partitions)
 !firmware/partitions_nocoredump.csv
+
+# Local secrets (Wi-Fi AP name/password). Template: firmware/include/secrets.example.h
+firmware/include/secrets.h
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# Temporary and OS files
+*.tmp
+*.bak
+*.swp
+*~
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini

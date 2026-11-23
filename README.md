@@ -76,8 +76,9 @@ pio run                              :: compile
 pio run -t upload --upload-port COM5 :: flash (use your COM port)
 pio device monitor -p COM5           :: serial console, 115200 baud
 ```
-Before flashing for the first time, edit `firmware/include/config.h`:
-`WIFI_AP_SSID` (default `M021-RIG`) and **`WIFI_AP_PASSWORD`** (default `CHANGE_ME`, change it).
+Before flashing for the first time, copy `firmware/include/secrets.example.h` to
+`firmware/include/secrets.h` (git-ignored) and set `WIFI_AP_SSID` (the docs assume `M021-RIG`)
+and **`WIFI_AP_PASSWORD`** (`<your-wifi-password>`, at least 8 characters). Never commit `secrets.h`.
 Do not change pins, thresholds, gains or timings without team approval.
 
 - The build uses its own partition table, `firmware/partitions_nocoredump.csv` (the Arduino

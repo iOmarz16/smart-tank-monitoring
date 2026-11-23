@@ -163,8 +163,13 @@ constexpr float P_COMP_RESET_P = 0.05f;   // mbar(g): P_comp resets when pump OF
 // ---------------------------------------------------------------------------
 // Communication (Section 3 of the brief). Local AP only, no Internet (Constraint 4).
 // ---------------------------------------------------------------------------
-#define WIFI_AP_SSID "M021-RIG"
-#define WIFI_AP_PASSWORD "CHANGE_ME"  // >= 8 chars (WPA2)
+// WIFI_AP_SSID and WIFI_AP_PASSWORD live in include/secrets.h (git-ignored).
+// First build: copy include/secrets.example.h to include/secrets.h and set them.
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "Missing firmware/include/secrets.h: copy secrets.example.h to secrets.h and set the Wi-Fi AP name and password"
+#endif
 constexpr uint8_t WIFI_AP_CHANNEL = 6;
 constexpr uint8_t WIFI_AP_MAX_CLIENTS = 2;
 // AP address 192.168.4.1 / 24
